@@ -1,0 +1,18 @@
+/* admin/scanner/styles.css */
+.hidden{display:none!important}
+.tabs{display:flex;gap:8px;margin-bottom:12px}
+.tablink{padding:6px 10px;border-radius:6px;border:1px solid #2b2f36;background:#0f1318;color:#e9eef5;cursor:pointer}
+.tablink.active{background:#1a2130}
+.tab{display:none}.tab.active{display:block}
+.form-compact select,.form-compact input,.form-compact textarea{background:#0f1318;color:#e9eef5;border:1px solid #2b2f36;border-radius:6px;padding:6px 8px}
+.btn{border:1px solid #2b2f36;padding:6px 10px;border-radius:6px;background:#1a2130;color:#e9eef5;cursor:pointer}
+.btn-primary{background:#15803d;border-color:#166534}
+.table-wrap{overflow-x:auto}
+.counters{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:8px;color:#c6ccd6}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;border:1px solid #2b2f36;font-size:12px;margin-right:6px}
+.label{display:inline-block;padding:2px 8px;border-radius:6px;background:#1d2530;border:1px solid #2b2f36}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:none;align-items:center;justify-content:center}
+.modal .modal-body{background:#101317;color:#e9eef5;border:1px solid #2b2f36;border-radius:8px;width:min(940px,95vw);max-height:80vh;overflow:hidden;box-shadow:0 10px 40px rgba(0,0,0,.6)}
+.modal .modal-head{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid #2b2f36}
+.modal .modal-head button{background:none;border:0;font-size:22px;line-height:1;cursor:pointer;color:#ccd3db}
+.modal .tablewrap{padding:10px 16px 16px;max-height:calc(80vh - 56px);overflow:auto}

@@ -1,0 +1,2114 @@
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/../lib/auth.php';
+require_once __DIR__ . '/../lib/db.php';
+require_once __DIR__ . '/../lib/helpers.php';
+require_once __DIR__ . '/../lib/settings.php';  // setting_get()
+@require_once __DIR__ . '/../lib/limit.php';
+@require_once __DIR__ . '/../lib/fx.php';
+@require_once __DIR__ . '/../lib/team_balance.php'; // team balance calc
+@require_once __DIR__ . '/../lib/telegram.php';
+
+/* ===== sort_key migration for payments (for manual ordering) ===== */
+if (!function_exists('ensure_payments_sortkey')) {
+  function ensure_payments_sortkey(): void {
+    try {
+      $col = db_row("SHOW COLUMNS FROM payments LIKE 'sort_key'");
+      if (!$col) {
+        @db_exec("ALTER TABLE payments ADD COLUMN sort_key BIGINT NULL");
+      }
+      @db_exec("UPDATE payments SET sort_key = id WHERE sort_key IS NULL");
+    } catch (Throwable $e) {
+      // ignore
+    }
+  }
+}
+ensure_payments_sortkey();
+
+
+
+/* ===== LOCAL_CARD_HELPERS_COMPAT (auto-injected) =====
+   Ensures card helpers are available even if not provided by includes.
+   The functions are defined only if missing.
+*/
+if (!function_exists('bank_label_from_row_local')) {
+  function bank_label_from_row_local(array $row): string {
+    foreach (['bank','bank_name','bank_type','issuer'] as $k) {
+      if (!empty($row[$k])) {
+        $v = strtolower((string)$row[$k]);
+        if (strpos($v,'privat')!==false) return 'Приват';
+        if (strpos($v,'mono')!==false)   return 'Моно';
+        return ucfirst($v);
+      }
+    }
+    return '—';
+  }
+}
+if (!function_exists('card_first4_from_row_local')) {
+  function card_first4_from_row_local(array $row): string {
+    foreach (['pan_first4','first4'] as $k) {
+      if (!empty($row[$k])) { $d = preg_replace('~\D~','',(string)$row[$k]); if (strlen($d)>=4) return substr($d,0,4); }
+    }
+    foreach (['card_number','pan','number'] as $k) {
+      if (!empty($row[$k])) { $d = preg_replace('~\D~','',(string)$row[$k]); if (strlen($d)>=4) return substr($d,0,4); }
+    }
+    return '????';
+  }
+}
+if (!function_exists('card_first6_from_row_local')) {
+  function card_first6_from_row_local(array $row): ?string {
+    foreach (['pan_first6','first6'] as $k) {
+      if (!empty($row[$k])) { $d = preg_replace('~\D~','',(string)$row[$k]); if (strlen($d)>=6) return substr($d,0,6); }
+    }
+    foreach (['card_number','pan','number'] as $k) {
+      if (!empty($row[$k])) { $d = preg_replace('~\D~','',(string)$row[$k]); if (strlen($d)>=6) return substr($d,0,6); }
+    }
+    return null;
+  }
+}
+if (!function_exists('card_brand_from_bin_local')) {
+  function card_brand_from_bin_local(?string $first6, string $first4): string {
+    $f4 = preg_replace('~\D~','',(string)$first4);
+    $f6 = $first6 ? preg_replace('~\D~','',(string)$first6) : null;
+    if ($f4 !== '' && isset($f4[0]) && $f4[0] === '4') return 'Visa';
+    if ($f6) {
+      $n6 = (int)$f6;
+      if ($n6 >= 222100 && $n6 <= 272099) return 'Mastercard';
+    }
+    if ($f4 !== '') {
+      $prefix2 = (int)substr($f4,0,2);
+      if ($prefix2 >= 51 && $prefix2 <= 55) return 'Mastercard';
+    }
+    return '—';
+  }
+}
+if (!function_exists('card_brand_from_row_local')) {
+  function card_brand_from_row_local(array $row): string {
+    $f4 = card_first4_from_row_local($row);
+    $f6 = card_first6_from_row_local($row);
+    return card_brand_from_bin_local($f6, $f4);
+  }
+}
+if (!function_exists('card_last4_from_row')) {
+  function card_last4_from_row(array $row): string {
+    foreach (['pan_last4','number_last4','last4','card_number','pan','number'] as $k) {
+      if (!empty($row[$k])) { $d = preg_replace('~\D~','',(string)$row[$k]); if ($d!=='') return substr($d,-4); }
+    }
+    return isset($row['id']) ? substr(str_pad((string)$row['id'],4,'0',STR_PAD_LEFT),-4) : '????';
+  }
+}
+if (!function_exists('mask_pan_last4')) {
+  function mask_pan_last4(string $l4): string {
+    $l4 = preg_replace('~\D~','',(string)$l4);
+    $l4 = substr($l4, -4);
+    return '**** **** **** '.($l4?:'????');
+  }
+}
+/* ===== /LOCAL_CARD_HELPERS_COMPAT ===== */
+
+// Global toggle to mute admin-chat notifications across UI
+if (!defined('ADMIN_NOTIFICATIONS_ENABLED')) { define('ADMIN_NOTIFICATIONS_ENABLED', false); }
+
+$title  = 'Оплаты/Пополнения';
+$active = 'payments';
+
+auth_require();
+auth_require_admin();
+csrf_check();
+
+/* ---------- мини-утилиты ---------- */
+if (!function_exists('db_cell')) {
+  function db_cell(string $sql, array $p = []) {
+    $st = db_exec($sql, $p);
+    return $st ? $st->fetchColumn(0) : null;
+  }
+}
+if (!function_exists('db_row')) {
+  function db_row(string $sql, array $p = []) {
+    $st = db_exec($sql, $p);
+    $r  = $st ? $st->fetch(PDO::FETCH_ASSOC) : false;
+    return $r ?: null;
+  }
+}
+if (!function_exists('db_all')) {
+  function db_all(string $sql, array $p = []): array {
+    $st = db_exec($sql, $p);
+    return $st ? $st->fetchAll(PDO::FETCH_ASSOC) : [];
+  }
+}
+if (!function_exists('set_flash')) {
+  if (session_status() !== PHP_SESSION_ACTIVE) { session_start(); }
+  function set_flash(string $type, string $message): void {
+    $_SESSION['__flash'][] = ['type'=>$type,'message'=>$message];
+  }
+}
+function json_out(array $payload): void {
+  // Ensure clean JSON: drop any earlier output
+  if (function_exists('ob_get_level')) { while (@ob_get_level() > 0) { @ob_end_clean(); } }
+  if (!headers_sent()) { header('Content-Type: application/json; charset=utf-8'); }
+  echo json_encode($payload, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
+  exit;
+}
+
+/* ==========================================================================
+   Telegram helpers (локальные рассылки)
+   ========================================================================== */
+function tg_api_local(string $m, array $p, ?string &$raw=null, ?string &$err=null){
+  try { return telegram_api($m,$p,$raw,$err); }
+  catch (Throwable $e) { $err=$e->getMessage(); return null; }
+}
+function tg_send_with_thread_local($chat_id, string $text, ?int $thread_id=null, ?array $markup=null, string $parse='HTML'){
+  $p=['chat_id'=>$chat_id,'text'=>$text,'disable_web_page_preview'=>true];
+  if($parse) $p['parse_mode']=$parse;
+  if($markup) $p['reply_markup']=json_encode($markup, JSON_UNESCAPED_UNICODE);
+  if($thread_id){ $p['message_thread_id']=(int)$thread_id; }
+  tg_api_local('sendMessage',$p,$raw,$err);
+}
+function detect_thread_col_local(string $table): ?string {
+  foreach (['message_thread_id','thread_id','topic_id'] as $c) {
+    try { $st = db_exec("SHOW COLUMNS FROM `{$table}` LIKE ?",[$c]); if ($st && $st->fetch()) return $c; } catch (Throwable $e) {}
+  }
+  return null;
+}
+function admin_chats_full_local(): array {
+  $out=[];
+  try {
+    $thr = detect_thread_col_local('admin_telegram_chats');
+    $cols = "chat_id".($thr? ", `$thr` AS thread":'');
+    foreach (db_all("SELECT {$cols} FROM admin_telegram_chats WHERE is_active=1") as $r){
+      $out[]=['chat_id'=>(string)$r['chat_id'],'thread'=>isset($r['thread'])?(int)$r['thread']:null];
+    }
+  } catch(Throwable $e){}
+  foreach (['tg_admin_chat_id','tg_admin_chat_ids','telegram_admin_chat'] as $k){
+    $raw=(string)setting_get($k,''); if($raw==='') continue;
+    foreach (preg_split('~[,\s]+~',$raw,-1,PREG_SPLИТ_NO_EMPTY) as $cid){
+      $out[]=['chat_id'=>(string)$cid,'thread'=>null];
+    }
+  }
+  $u=[]; $res=[];
+  foreach($out as $r){ $key=$r['chat_id'].'#'.($r['thread']??0); if(!isset($u[$key])){$u[$key]=1; $res[]=$r;} }
+  return $res;
+}
+function team_chats_by_card_local(int $card_id): array {
+  $rows = [];
+  try {
+    $thr  = detect_thread_col_local('team_telegram_chats');
+    $cols = "ttc.chat_id" . ($thr ? ", ttc.`{$thr}` AS thread" : '');
+    if ((int)db_cell("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='cards' AND column_name='buyer_id'")) {
+      $rows = db_all("SELECT DISTINCT {$cols}
+                        FROM team_telegram_chats ttc
+                        JOIN buyers b ON b.team_id = ttc.team_id
+                        JOIN cards  c ON c.buyer_id = b.id
+                       WHERE ttc.is_active = 1 AND c.id = ?", [$card_id]);
+    }
+    if (!$rows && (int)db_cell("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='cards' AND column_name='team_id'")) {
+      $rows = db_all("SELECT DISTINCT {$cols}
+                        FROM team_telegram_chats ttc
+                        JOIN cards c ON c.team_id = ttc.team_id
+                       WHERE ttc.is_active = 1 AND c.id = ?", [$card_id]);
+    }
+  } catch (Throwable $e) {}
+  // Map and de-duplicate by chat_id + normalized thread (NULL and 0 treated equally).
+  $out = array_map(fn($r) => ['chat_id' => (string)$r['chat_id'], 'thread' => isset($r['thread']) ? (int)$r['thread'] : null], $rows);
+  $uniq = []; $res = [];
+  foreach ($out as $r) {
+    $key = $r['chat_id'] . '#' . ($r['thread'] ?? 0);
+    if (!isset($uniq[$key])) { $uniq[$key] = 1; $res[] = $r; }
+  }
+  return $res;
+}
+function send_to_team_chats_local_by_card(int $card_id, string $text): void {
+  $sent = [];
+  foreach (team_chats_by_card_local($card_id) as $c) {
+    $key = $c['chat_id'].'#'.($c['thread'] ?? 0);
+    if (isset($sent[$key])) { continue; }
+    $sent[$key] = 1;
+    tg_send_with_thread_local($c['chat_id'], $text, $c['thread']);
+  }
+}
+function admin_broadcast_local(string $text): void {
+  if (defined('ADMIN_NOTIFICATIONS_ENABLED') && !ADMIN_NOTIFICATIONS_ENABLED) { return; }
+
+  foreach (admin_chats_full_local() as $a) tg_send_with_thread_local($a['chat_id'],$text,$a['thread']);
+}
+
+/* ==========================================================================
+   FX + schema
+   ========================================================================== */
+function uah_to_usd_local(float $uah): float {
+  if (function_exists('fx_uah_to_usd')) {
+    try { return (float)fx_uah_to_usd($uah); } catch(Throwable $e){}
+  }
+  $fx = (float)setting_get('manual_fx','40'); if ($fx <= 0) $fx = 40.0;
+  return $uah / $fx;
+}
+function payments_ensure_table(): void {
+  try {
+    db_exec("CREATE TABLE IF NOT EXISTS `payments`(
+      `id` INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      `card_id` INT NOT NULL,
+      `buyer_id_at_op` INT NULL,
+      `team_id_at_op`  INT NULL,
+      `buyer_name_at_op` VARCHAR(128) NULL,
+      `team_name_at_op`  VARCHAR(128) NULL,
+      `type` ENUM('topup','debit','hold') NOT NULL,
+      `amount_uah` DECIMAL(14,2) NOT NULL DEFAULT 0,
+      `note` VARCHAR(255) NULL,
+      `is_void` TINYINT(1) NOT NULL DEFAULT 0,
+      `voided_at` DATETIME NULL,
+      `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX (`card_id`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+  } catch (Throwable $e) {}
+
+  try { db_exec("ALTER TABLE `payments` ADD COLUMN IF NOT EXISTS `buyer_id_at_op` INT NULL AFTER `card_id`"); } catch (Throwable $e) {}
+  try { db_exec("ALTER TABLE `payments` ADD COLUMN IF NOT EXISTS `team_id_at_op` INT NULL AFTER `buyer_id_at_op`"); } catch (Throwable $e) {}
+  try { db_exec("ALTER TABLE `payments` ADD COLUMN IF NOT EXISTS `buyer_name_at_op` VARCHAR(128) NULL AFTER `team_id_at_op`"); } catch (Throwable $e) {}
+  try { db_exec("ALTER TABLE `payments` ADD COLUMN IF NOT EXISTS `team_name_at_op`  VARCHAR(128) NULL AFTER `buyer_name_at_op`"); } catch (Throwable $e) {}
+}
+function db_has_column(string $t,string $c): bool {
+  try { return db_exec("SHOW COLUMNS FROM `{$t}` LIKE ?",[$c])->fetch()?true:false; } catch(Throwable $e){ return false; }
+}
+function cards_balance_column(): string {
+  foreach (['balance_uah','balance','current_balance','bal_uah'] as $cand) {
+    if (db_has_column('cards',$cand)) return $cand;
+  }
+  try { db_exec("ALTER TABLE `cards` ADD COLUMN `balance_uah` DECIMAL(14,2) NOT NULL DEFAULT 0"); } catch (Throwable $e) {}
+  return 'balance_uah';
+}
+payments_ensure_table();
+$bal_col = cards_balance_column();
+
+/* ---------- helpers ---------- */
+function cards_for_operations(): array {
+  try {
+    return db_all("SELECT c.*, b.name AS buyer_name, b.id AS buyer_id, t.name AS team_name, t.id AS team_id
+                     FROM cards c
+                LEFT JOIN buyers b ON b.id=c.buyer_id
+                LEFT JOIN teams  t ON t.id=b.team_id
+                    WHERE IFNULL(c.status,'waiting') IN ('in_work','waiting')
+                 ORDER BY t.name, b.name, c.id DESC");
+  } catch (Throwable $e) {
+    try { return db_all("SELECT * FROM cards ORDER BY id DESC"); } catch(Throwable $e2){ return []; }
+  }
+}
+
+/* ==========================================================================
+   Пороговые уведомления (без изменений)
+   ========================================================================== */
+function maybe_admin_alert_card_balance_low(int $card_id, float $card_balance_uah, string $card_last4, ?int $team_id, ?string $team_name): void {
+  $usd = uah_to_usd_local($card_balance_uah);
+  $th  = 400.0;
+  $key = 'alert_card_usd_'.$card_id;
+  $state = (string)setting_get($key,'ok');
+
+  if ($usd < $th && $state !== 'low') {
+    $msg = "👑 <b>ADMIN</b>\n⚠️ Низкий баланс карты •••• {$card_last4}\n"
+         . "💵 ≈ ".number_format($usd,2,'.',' ')." USD  (~ ".number_format($card_balance_uah,2,'.',' ')." UAH)\n"
+         . ($team_id? "👥 Команда: <b>#{$team_id}</b>".($team_name? " — ".h($team_name):'')."\n":'')
+         . "Порог: <b>400 USD</b>.";
+    admin_broadcast_local($msg);
+    setting_set($key,'low');
+  } elseif ($usd > ($th*1.05) && $state !== 'ok') {
+    setting_set($key,'ok');
+  }
+}
+function maybe_admin_alert_card_limit_thresholds(int $card_id, ?float $limit_left_uah, ?float $limit_cap_uah, string $card_last4, ?int $team_id, ?string $team_name): void {
+  if ($limit_left_uah === null) return;
+  $levels = [60000=>'60k', 30000=>'30k', 10000=>'10k'];
+  $current = 'ok';
+  foreach ($levels as $u=>$label) { if ($limit_left_uah < $u) { $current = $label; break; } }
+  $key = 'alert_card_limit_'.$card_id;
+  $prev = (string)setting_get($key,'ok');
+  $rank = ['ok'=>0,'60k'=>1,'30k'=>2,'10k'=>3];
+
+  if ($rank[$current] > $rank[$prev]) {
+    $title = $current==='60k'?'< 60 000 UAH':($current==='30k'?'< 30 000 UAH':'< 10 000 UAH');
+    $msg = "👑 <b>ADMIN</b>\n⚠️ Остаток лимита по карте •••• {$card_last4} стал <b>{$title}</b>\n"
+         . "🧮 Остаток: ".number_format($limit_left_uah,2,'.',' ')." UAH"
+         . ($limit_cap_uah!==null? "  (cap: ".number_format((float)$limit_cap_uah,0,'',' ')." UAH)":"")."\n"
+         . ($team_id? "👥 Команда: <b>#{$team_id}</b>".($team_name? " — ".h($team_name):'')."\n":'');
+    admin_broadcast_local($msg);
+    setting_set($key,$current);
+  }
+  if ($limit_left_uah >= 61000 && $prev!=='ok') setting_set($key,'ok');
+}
+function maybe_admin_alert_team_balance_low(int $team_id, string $bal_col): void {
+  try {
+    $sum_uah = (float)db_cell(
+      "SELECT COALESCE(SUM(c.`$bal_col`),0)
+         FROM cards c
+         JOIN buyers b ON b.id=c.buyer_id
+        WHERE b.team_id=?", [$team_id]
+    );
+  } catch (Throwable $e) { $sum_uah = 0.0; }
+
+  $usd = uah_to_usd_local($sum_uah);
+  $th  = 500.0;
+  $key = 'alert_team_usd_'.$team_id;
+  $state = (string)setting_get($key,'ok');
+
+  if ($usd < $th && $state !== 'low') {
+    $teamName = (string)db_cell("SELECT name FROM teams WHERE id=?",[$team_id]);
+    $msg = "👑 <b>ADMIN</b>\n⚠️ Низкий общий баланс команды <b>#{$team_id}</b>".($teamName? " — ".h($teamName):'')."\n"
+         . "💵 ≈ ".number_format($usd,2,'.',' ')." USD  (~ ".number_format($sum_uah,2,'.',' ')." UAH)\n"
+         . "Порог: <b>500 USD</b>.";
+    admin_broadcast_local($msg);
+    setting_set($key,'low');
+  } elseif ($usd > ($th*1.05) && $state!=='ok') {
+    setting_set($key,'ok');
+  }
+}
+
+/* ==========================================================================
+   POST: Экспорт TXT
+   ========================================================================== */
+if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['export_team_txt'])) {
+  $team_id = (int)($_POST['team_id'] ?? 0);
+  $df = preg_replace('~[^0-9\-]~', '', (string)($_POST['date_from'] ?? ''));
+  $dt = preg_replace('~[^0-9\-]~', '', (string)($_POST['date_to']   ?? ''));
+  $start = $df ? ($df.' 00:00:00') : date('Y-m-01 00:00:00');
+  $end   = $dt ? ($dt.' 23:59:59') : date('Y-m-t 23:59:59');
+  $include_void = !empty($_POST['include_void']);
+
+  if ($team_id <= 0) { set_flash('error','Выберите команду для экспорта'); header('Location:/admin/payments.php'); exit; }
+
+  $team = db_row("SELECT id,name FROM teams WHERE id=?",[$team_id]);
+  $teamName = $team ? (string)$team['name'] : ('Team#'.$team_id);
+
+  // Единая корректная формула разбора даты
+  $dtExpr = "COALESCE(
+      STR_TO_DATE(p.created_at, '%Y-%m-%d %H:%i:%s'),
+      STR_TO_DATE(p.created_at, '%Y-%m-%d %H:%i'),
+      STR_TO_DATE(p.created_at, '%d.%m.%Y %H:%i:%s'),
+      STR_TO_DATE(p.created_at, '%d.%m.%Y %H:%i'),
+      STR_TO_DATE(p.created_at, '%d.%m.%Y')
+  )";
+
+  $sql = "SELECT p.*, c.*, b.name AS buyer_cur, t.name AS team_cur,
+                 COALESCE(p.team_id_at_op, t.id)      AS team_id_hist,
+                 COALESCE(p.team_name_at_op, t.name)  AS team_name_hist,
+                 COALESCE(p.buyer_name_at_op, b.name) AS buyer_name_hist,
+                 {$dtExpr} AS op_dt
+            FROM payments p
+       LEFT JOIN cards  c ON c.id=p.card_id
+       LEFT JOIN buyers b ON b.id=c.buyer_id
+       LEFT JOIN teams  t ON t.id=b.team_id
+           WHERE COALESCE(p.team_id_at_op, t.id) = ?
+             AND {$dtExpr} BETWEEN ? AND ?";
+
+  $params = [$team_id, $start, $end];
+  if (!$include_void) { $sql .= " AND IFNULL(p.is_void,0)=0 "; }
+  $sql .= " ORDER BY op_dt ASC, p.id ASC";
+  $rows = db_all($sql, $params);
+
+  // группировка
+  $byCard = [];
+  foreach ($rows as $r) {
+    $cardId = (int)$r['card_id'];
+    $last4  = card_last4_from_row($r);
+    $tb     = trim((($r['team_name_hist'] ?? '') . (!empty($r['buyer_name_hist']) ? ' → '.$r['buyer_name_hist'] : '')));
+    $op_dt  = $r['op_dt'] ?: $r['created_at'];
+    $ts     = $op_dt ? strtotime($op_dt) : 0;
+
+    if (!isset($byCard[$cardId])) {
+      $brand = card_brand_from_row_local($r);
+      $postfix = ($brand !== '—' ? ($brand.' '.$last4) : $last4);
+      $label_no_tb = trim(bank_label_from_row_local($r).' '.$postfix);
+      $label = $label_no_tb . ($tb!=='' ? " — {$tb}" : '');
+      $byCard[$cardId] = [
+        'label' => $label,
+        'card'  => $label_no_tb,
+        'tb'    => $tb,
+        'ops'   => ['debit'=>[], 'topup'=>[], 'hold'=>[]],
+        'sum'   => ['debit'=>0.0, 'topup'=>0.0, 'hold'=>0.0],
+      ];
+    }
+
+    $type = strtolower((string)$r['type']);
+    if (!isset($byCard[$cardId]['ops'][$type])) { $type='debit'; }
+
+    $byCard[$cardId]['ops'][$type][] = [
+      'ts'      => $ts,
+      'when'    => $ts ? date('d.m.Y H:i', $ts) : '',
+      'amount'  => (float)$r['amount_uah'],
+      'is_void' => (int)($r['is_void'] ?? 0) === 1,
+    ];
+    $byCard[$cardId]['sum'][$type] += (float)$r['amount_uah'];
+  }
+
+  uasort($byCard, fn($a,$b)=>strcmp($a['label'],$b['label']));
+  foreach ($byCard as &$cdata) {
+    foreach (['debit','topup','hold'] as $t) {
+      usort($cdata['ops'][$t], fn($x,$y)=> $x['ts'] <=> $y['ts']);
+    }
+  } unset($cdata);
+
+  // ===== Excel export (.xls with HTML table) =====
+$total_cnt = count($rows);
+$sum_topup = $sum_debit = $sum_hold = 0.0;
+foreach ($byCard as $cdata) {
+  $sum_topup += (float)$cdata['sum']['topup'];
+  $sum_debit += (float)$cdata['sum']['debit'];
+  $sum_hold  += (float)$cdata['sum']['hold'];
+}
+
+$fname = 'export_team_'.$team_id.'_'.date('Ymd',strtotime($start)).'-'.date('Ymd',strtotime($end)).'.xls';
+header('Content-Type: application/vnd.ms-excel; charset=utf-8');
+header('Content-Disposition: attachment; filename="'.$fname.'"');
+
+echo "<html><head><meta charset=\"utf-8\"><style>table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px;font-family:Arial, sans-serif;font-size:12px;white-space:nowrap}</style></head><body>";
+echo "<table>";
+echo "<tr><td colspan=\"7\"><b>Команда:</b> ".htmlspecialchars($teamName, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')."</td></tr>";
+echo "<tr><td colspan=\"7\"><b>Период:</b> ".date('d.m.Y', strtotime($start))." — ".date('d.m.Y', strtotime($end))."</td></tr>";
+echo "<tr><td colspan=\"7\"><b>Операций:</b> ".$total_cnt."</td></tr>";
+echo "<tr><td colspan=\"7\"></td></tr>";
+echo "<tr>";
+echo "<th>Карта</th><th>Команда → Байер</th><th>Тип</th><th>Дата и время</th><th>Сумма</th><th>Валюта</th><th>Статус</th>";
+echo "</tr>";
+
+$sections = ['debit'=>'Списание', 'topup'=>'Пополнение', 'hold'=>'Холд'];
+foreach ($byCard as $cdata) {
+  $cardLabel = htmlspecialchars((string)($cdata['card'] ?? $cdata['label']), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+  $tbLabel   = htmlspecialchars((string)($cdata['tb'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+  foreach ($sections as $t=>$tTitle) {
+    foreach ($cdata['ops'][$t] as $op) {
+      $amt = (float)$op['amount'];
+      if ($t==='debit') $amt = -$amt;
+      $dt  = htmlspecialchars($op['when'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+      $st  = $op['is_void'] ? 'void' : '';
+      echo "<tr>";
+      echo "<td>{$cardLabel}</td><td>{$tbLabel}</td><td>{$tTitle}</td><td>{$dt}</td>";
+      echo "<td style=\"mso-number-format:'0.00';\">".$amt."</td><td>грн</td><td>{$st}</td>";
+      echo "</tr>";
+    }
+  }
+}
+
+echo "<tr><td colspan=\"7\"></td></tr>";
+echo "<tr><th colspan=\"4\" style=\"text-align:right\">Итого (шт)</th><th>".$total_cnt."</th><th colspan=\"2\"></th></tr>";
+echo "<tr><th colspan=\"4\" style=\"text-align:right\">Пополнения</th><th style=\"mso-number-format:'0.00';\">".$sum_topup."</th><th>грн</th><th></th></tr>";
+echo "<tr><th colspan=\"4\" style=\"text-align:right\">Списания</th><th style=\"mso-number-format:'0.00';\">".(-$sum_debit)."</th><th>грн</th><th></th></tr>";
+echo "<tr><th colspan=\"4\" style=\"text-align:right\">Холды</th><th style=\"mso-number-format:'0.00';\">".$sum_hold."</th><th>грн</th><th></th></tr>";
+
+echo "</table></body></html>";
+exit;
+}
+
+/* ==========================================================================
+   AJAX: история (команды/карты) — HTML строками
+   ========================================================================== */
+$IS_AJAX = (($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '') === 'XMLHttpRequest') || isset($_POST['ajax']) || isset($_GET['ajax']);
+// For AJAX responses we must not leak HTML warnings (breaks JSON)
+if ($IS_AJAX) { @ini_set('display_errors','0'); @ini_set('html_errors','0'); }
+if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['fetch_history'])) {
+  $scope = trim((string)($_POST['scope'] ?? ''));
+  $id    = (int)($_POST['id'] ?? 0);
+  $limit = max(1, min(500, (int)($_POST['limit'] ?? 100)));
+
+  if (!in_array($scope, ['team','card'], true) || $id<=0) {
+    json_out(['ok'=>false,'error'=>'Некорректные параметры']);
+  }
+
+  if ($scope==='card') {
+    $rows = db_all(
+      "SELECT c.*, p.*,
+              COALESCE(p.buyer_name_at_op, b.name) AS buyer_name,
+              COALESCE(p.team_name_at_op,  t.name) AS team_name
+         FROM payments p
+    LEFT JOIN cards  c ON c.id=p.card_id
+    LEFT JOIN buyers b ON b.id=c.buyer_id
+    LEFT JOIN teams  t ON t.id=b.team_id
+        WHERE p.card_id=?
+     ORDER BY COALESCE(p.sort_key, p.id) DESC, p.id DESC
+        LIMIT {$limit}",
+      [$id]
+    );
+  } else {
+    $rows = db_all(
+      "SELECT c.*, p.*,
+              COALESCE(p.buyer_name_at_op, b.name) AS buyer_name,
+              COALESCE(p.team_name_at_op,  t.name) AS team_name
+         FROM payments p
+    LEFT JOIN cards  c ON c.id=p.card_id
+    LEFT JOIN buyers b ON b.id=c.buyer_id
+    LEFT JOIN teams  t ON t.id=b.team_id
+        WHERE COALESCE(p.team_id_at_op, t.id) = ?
+     ORDER BY COALESCE(p.sort_key, p.id) DESC, p.id DESC
+        LIMIT {$limit}",
+      [$id]
+    );
+  }
+
+  ob_start();
+  foreach ($rows as $r):
+    $last4 = card_last4_from_row($r);
+    $op    = strtolower($r['type'] ?? '');
+    $voided= (int)($r['is_void'] ?? 0) === 1;
+    $tb    = trim((($r['team_name'] ?? '') . (!empty($r['buyer_name']) ? ' → '.$r['buyer_name'] : '')));
+    $note  = (string)($r['note'] ?? '');
+    $opShort = ($op==='debit'?'списание':($op==='hold'?'холд':'пополнение'));
+?>
+<tr data-op="<?= $voided ? 'void' : h($op) ?>"
+    data-id="<?= (int)$r['id'] ?>"
+    data-last4="<?= h($last4) ?>"
+    data-tb="<?= h($tb) ?>"
+    data-note="<?= h($note) ?>"
+    data-created="<?= (int)(strtotime((string)($r['created_at'] ?? '')) ?: 0) ?>"
+    data-amount="<?= number_format((float)($r['amount_uah'] ?? 0), 2, '.', '') ?>"
+    data-card="<?= h(trim(bank_label_from_row_local($r).' '.card_brand_from_row_local($r).' '.$last4)) ?>"
+    style="<?= $voided ? 'opacity:.55;' : '' ?>">
+  <td class="num">
+    <div class="id-cell">
+      <?php $canMove = !$voided; ?>
+      <?php if ($canMove): ?>
+        <div class="move-btns">
+          <button type="button" class="btn btn-xs" data-move="up" data-id="<?= (int)$r['id'] ?>" title="Переместить выше">↑</button>
+          <button type="button" class="btn btn-xs" data-move="down" data-id="<?= (int)$r['id'] ?>" title="Переместить ниже">↓</button>
+        </div>
+      <?php endif; ?>
+      <div class="id-val"><?= (int)$r['id'] ?></div>
+    </div>
+  </td>
+  <td class="muted">
+  <div class="muted"><?= h($r['created_at'] ?? '') ?></div>
+  <form method="post" class="form-row" style="gap:6px;margin-top:6px;align-items:center">
+    <?= csrf_field(); ?>
+    <input type="hidden" name="payment_id" value="<?= (int)$r['id'] ?>">
+    <?php
+      $__dt = null;
+      try { $__dt = new DateTime((string)($r['created_at'] ?? 'now')); } catch (Throwable $e) { $__dt = new DateTime(); }
+      $__day = (int)$__dt->format('j');
+      $__mon = (int)$__dt->format('n');
+    ?>
+    <input type="number" name="day" min="1" max="31" value="<?= $__day ?>" style="width:64px" <?= $voided ? 'disabled' : '' ?> aria-label="День месяца">
+    <select name="month" <?= $voided ? 'disabled' : '' ?> aria-label="Месяц">
+      <?php for ($__m = 1; $__m <= 12; $__m++): ?>
+        <option value="<?= $__m ?>" <?= ($__m === $__mon ? 'selected' : '') ?>><?= sprintf('%02d', $__m) ?></option>
+      <?php endfor; ?>
+    </select>
+    <button class="btn" name="update_date" value="1" <?= $voided ? 'disabled' : '' ?> aria-label="Сохранить дату операции #<?= (int)$r['id'] ?>">Сохранить</button>
+  </form>
+</td>
+  <td class="td-mono"><?= h(trim(bank_label_from_row_local($r).' '.(($br=card_brand_from_row_local($r))!=='—' ? $br : ''))) ?> • <?= h($last4) ?> — <?= h($opShort) ?></td>
+  <td><?= h($tb) ?></td>
+  <td>
+    <span class="badge <?= $voided ? 'status-archived' : ($op==='debit'?'status-processing':($op==='hold'?'status-await':'status-in_work')) ?>">
+      <?= $voided ? 'void' : h($op ?: '—') ?>
+    </span>
+  </td>
+  <td class="num"><?= number_format((float)($r['amount_uah'] ?? 0),2,'.',' ') ?></td>
+  <td>
+    <form method="post" class="form-row" style="gap:6px">
+      <?= csrf_field(); ?>
+      <input type="hidden" name="payment_id" value="<?= (int)$r['id'] ?>">
+      <input type="text" name="note" value="<?= h($note) ?>" placeholder="Комментарий..." style="min-width:220px" <?= $voided?'disabled':'' ?> aria-label="Заметка к операции #<?= (int)$r['id'] ?>">
+      <button class="btn" name="update_note" value="1" <?= $voided?'disabled':'' ?> aria-label="Сохранить заметку">Сохранить</button>
+    </form>
+  </td>
+  <td class="num td-actions">
+    <?php if (!$voided): ?>
+      <form method="post" onsubmit="return confirm('Отменить (void) эту операцию? Это откатит баланс/лимит.')">
+        <?= csrf_field(); ?>
+        <input type="hidden" name="payment_id" value="<?= (int)$r['id'] ?>">
+        <button class="btn btn-danger" name="void_payment" value="1" title="Отменить" aria-label="Отменить операцию #<?= (int)$r['id'] ?>">&times;</button>
+      </form>
+    <?php else: ?>
+      <form method="post" onsubmit="return confirm('Полностью удалить эту операцию? Действие необратимо. Баланс/лимит НЕ меняются, т.к. операция уже отменена.')">
+        <?= csrf_field(); ?>
+        <input type="hidden" name="payment_id" value="<?= (int)$r['id'] ?>">
+        <button class="btn btn-danger" name="delete_payment" value="1" title="Удалить навсегда" aria-label="Удалить операцию #<?= (int)$r['id'] ?>">&times;</button>
+      </form>
+    <?php endif; ?>
+  </td>
+</tr>
+<?php
+  endforeach;
+  $html = ob_get_clean();
+  json_out(['ok'=>true, 'html'=>$html, 'count'=>count($rows)]);
+}
+
+
+/* ==========================================================================
+   AJAX: reorder payment (swap sort_key with neighbor within current context)
+   ========================================================================== */
+if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['reorder_payment'])) {
+  $scope = trim((string)($_POST['scope'] ?? ''));
+  $ctxId = (int)($_POST['id'] ?? 0);
+  $pid   = (int)($_POST['payment_id'] ?? 0);
+  $dir   = trim((string)($_POST['direction'] ?? ''));
+  if (!in_array($scope, ['team','card'], true) || $ctxId<=0 || $pid<=0 || !in_array($dir, ['up','down'], true)) {
+    json_out(['ok'=>false,'error'=>'Некорректные параметры']); 
+  }
+  // current row
+  $cur = db_row("SELECT id, card_id, type, IFNULL(is_void,0) AS is_void, COALESCE(sort_key,id) AS sk FROM payments WHERE id=?", [$pid]);
+  if (!$cur) { json_out(['ok'=>false,'error'=>'Операция не найдена']); }
+  if ((int)$cur['is_void'] === 1) { json_out(['ok'=>false,'error'=>'Операция void — перемещение запрещено']); }
+  // only move allowed types
+  $allowed = ['debit','topup','hold'];
+  if (!in_array(strtolower((string)$cur['type']), $allowed, true)) { json_out(['ok'=>false,'error'=>'Этот тип нельзя перемещать']); }
+  // normalize sk for current row
+  $curSk = (int)($cur['sk'] ?? $cur['id']);
+  if ($curSk <= 0) $curSk = (int)$cur['id'];
+
+  if ($scope==='card') {
+    $ctxWhere = "p.card_id = ?";
+    $params   = [$ctxId];
+    $join     = "";
+  } else {
+    $ctxWhere = "COALESCE(p.team_id_at_op, t.id) = ?";
+    $params   = [$ctxId];
+    $join     = "LEFT JOIN cards c ON c.id=p.card_id
+                 LEFT JOIN buyers b ON b.id=c.buyer_id
+                 LEFT JOIN teams  t ON t.id=b.team_id";
+  }
+
+  // neighbor selector depending on direction
+  if ($dir === 'up') {
+    $cond = "(COALESCE(p.sort_key,p.id) > ? OR (COALESCE(p.sort_key,p.id)=? AND p.id > ?))";
+    $order = "ORDER BY COALESCE(p.sort_key,p.id) ASC, p.id ASC";
+  } else { // down
+    $cond = "(COALESCE(p.sort_key,p.id) < ? OR (COALESCE(p.sort_key,p.id)=? AND p.id < ?))";
+    $order = "ORDER BY COALESCE(p.sort_key,p.id) DESC, p.id DESC";
+  }
+  $sqlNeighbor = "SELECT p.id, COALESCE(p.sort_key,p.id) AS sk
+                    FROM payments p
+                    {$join}
+                   WHERE {$ctxWhere}
+                     AND IFNULL(p.is_void,0) != 1
+                     AND p.type IN ('debit','topup','hold')
+                     AND {$cond}
+                   {$order}
+                   LIMIT 1";
+  $neighbor = db_row($sqlNeighbor, array_merge($params, [$curSk, $curSk, (int)$cur['id']]));
+  if (!$neighbor) { json_out(['ok'=>true,'message'=>'Нет соседней операции']); }
+
+  $nId = (int)$neighbor['id'];
+  $nSk = (int)($neighbor['sk'] ?? $neighbor['id']);
+  if ($nSk <= 0) $nSk = $nId;
+
+  try {
+    // ensure sort_key present and initialized
+    ensure_payments_sortkey();
+    db_exec("UPDATE payments SET sort_key=? WHERE id=?", [$nSk, (int)$cur['id']]);
+    db_exec("UPDATE payments SET sort_key=? WHERE id=?", [$curSk, $nId]);
+    json_out(['ok'=>true,'swapped_with'=>$nId]);
+  } catch (Throwable $e) {
+    json_out(['ok'=>false,'error'=>'Не удалось поменять порядок']);
+  }
+}
+
+/* ==========================================================================
+   AJAX: reorder many (bulk set sort_key by DOM order within current context)
+   ========================================================================== */
+if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['reorder_many'])) {
+  $scope = trim((string)($_POST['scope'] ?? ''));
+  $ctxId = (int)($_POST['id'] ?? 0);
+  $idsRaw = (string)($_POST['ids'] ?? '[]');
+  $idsArr = json_decode($idsRaw, true);
+  if (!is_array($idsArr)) { $idsArr = []; }
+  $ids = array_values(array_unique(array_map('intval', $idsArr)));
+  if (!in_array($scope, ['team','card'], true) || $ctxId<=0 || count($ids)===0) {
+    json_out(['ok'=>false,'error'=>'Некорректные параметры (scope/id/ids)']);
+  }
+
+  // В текущем контексте разрешены только debit/topup/hold и не-void
+  $allowed = ['debit','topup','hold'];
+  $inList = implode(',', array_map('intval', $ids));
+
+  if ($scope==='card') {
+    $rows = db_all("SELECT p.id, LOWER(p.type) AS type, IFNULL(p.is_void,0) AS is_void
+                      FROM payments p
+                     WHERE p.card_id = ? AND p.id IN ($inList)", [$ctxId]);
+  } else { // team
+    $rows = db_all("SELECT p.id, LOWER(p.type) AS type, IFNULL(p.is_void,0) AS is_void
+                      FROM payments p
+                      JOIN cards c ON c.id=p.card_id
+                     WHERE COALESCE(p.team_id_at_op, c.team_id) = ? AND p.id IN ($inList)", [$ctxId]);
+  }
+  $map = [];
+  foreach ($rows as $r) {
+    $id  = (int)$r['id'];
+    $typ = strtolower((string)($r['type'] ?? ''));
+    $void= (int)($r['is_void'] ?? 0);
+    if ($void===0 && in_array($typ, $allowed, true)) { $map[$id] = true; }
+  }
+  $filtered = array_values(array_filter($ids, function($x) use ($map){ return isset($map[$x]); }));
+  if (count($filtered)===0) {
+    json_out(['ok'=>false,'error'=>'Нет допустимых операций для перестановки']);
+  }
+
+  // Назначаем убывающие sort_key чтобы верхние шли первыми (ORDER BY COALESCE(sort_key,id) DESC)
+  $base = (int)floor(microtime(true)*1000);
+  $n = count($filtered);
+  $cases = [];
+  foreach ($filtered as $i => $pid) {
+    $val = $base + ($n - $i); // верхняя строка получит самое большое значение
+    $cases[] = "WHEN {$pid} THEN {$val}";
+  }
+  $inUpd = implode(',', $filtered);
+  $sql = "UPDATE payments SET sort_key = CASE id ".implode(' ', $cases)." ELSE sort_key END WHERE id IN ($inUpd)";
+  try {
+    if (function_exists('db_exec')) {
+      db_exec($sql, []);
+      json_out(['ok'=>true, 'updated'=>count($filtered)]);
+    } else {
+      json_out(['ok'=>false,'error'=>'db_exec() недоступен']);
+    }
+  } catch (Throwable $e) {
+    json_out(['ok'=>false,'error'=>'DB error: '.$e->getMessage()]);
+  }
+}
+
+/* ==========================================================================
+   POST actions (добавлен режим ajax=1 — JSON вместо редиректа)
+   ========================================================================== */
+$IS_AJAX = $IS_AJAX || false;
+$SELF    = '/admin/payments.php';
+
+if ($_SERVER['REQUEST_METHOD']==='POST') {
+
+  /* добавить операцию */
+  if (isset($_POST['add_payment'])) {
+    $cid  = (int)($_POST['card_id'] ?? 0);
+    $type = trim((string)($_POST['type'] ?? ''));
+    $amt  = (float)($_POST['amount_uah'] ?? 0);
+    if ($cid<=0){ if($IS_AJAX){ json_out(['ok'=>false,'error'=>'Не выбрана карта']); } set_flash('error','Не выбрана карта'); header('Location: '.$SELF); exit; }
+    if (!in_array($type,['topup','debit','hold'],true)){ if($IS_AJAX){ json_out(['ok'=>false,'error'=>'Некорректный тип операции']); } set_flash('error','Некорректный тип операции'); header('Location: '.$SELF); exit; }
+    if ($amt<=0){ if($IS_AJAX){ json_out(['ok'=>false,'error'=>'Сумма должна быть больше 0']); } set_flash('error','Сумма должна быть больше 0'); header('Location: '.$SELF); exit; }
+
+    /* снимок привязки карты */
+    $card = null;
+    try {
+      $card = db_row("SELECT c.*,
+                             b.id   AS buyer_id,
+                             b.name AS buyer_name,
+                             t.id   AS team_id,
+                             t.name AS team_name
+                        FROM cards c
+                   LEFT JOIN buyers b ON b.id=c.buyer_id
+                   LEFT JOIN teams  t ON t.id=b.team_id
+                       WHERE c.id=?", [$cid]);
+    } catch (Throwable $e) {}
+
+    $buyer_id_snap   = $card && !empty($card['buyer_id'])  ? (int)$card['buyer_id']  : null;
+    $team_id_snap    = $card && !empty($card['team_id'])   ? (int)$card['team_id']   : null;
+    $buyer_name_snap = $card['buyer_name'] ?? null;
+    $team_name_snap  = $card['team_name'] ?? null;
+
+    /* DEDUP окно с drop_ops */
+    $skip_balance_limit_update = false;
+    try {
+      $windowMin = (int)setting_get('ops_dedup_window_min','30');
+      if ($windowMin < 1) $windowMin = 30;
+      $dupeCount = (int)db_cell(
+        "SELECT COUNT(*) FROM drop_ops
+          WHERE card_id=? AND type=? AND ABS(amount_uah-?)<0.01
+            AND created_at BETWEEN DATE_SUB(NOW(), INTERVAL ? MINUTE)
+                               AND     DATE_ADD(NOW(), INTERVAL ? MINUTE)",
+        [$cid, $type, $amt, $windowMin, $windowMin]
+      );
+      if ($dupeCount > 0) $skip_balance_limit_update = true;
+    } catch (Throwable $e) {}
+
+    // 1) лимит
+    $limit_left = null; $limit_cap = null;
+    if (!$skip_balance_limit_update && function_exists('limit_apply_operation')) {
+      if ($type==='debit') {
+        $lr = limit_apply_operation($cid,'debit',$amt);
+        if (!$lr['ok']) {
+          if ($IS_AJAX) { json_out(['ok'=>false,'error'=>$lr['error'] ?? 'Превышен лимит']); }
+          set_flash('error',$lr['error'] ?? 'Превышен лимит'); header('Location: '.$SELF); exit;
+        }
+        $limit_left = isset($lr['limit_remaining']) ? (float)$lr['limit_remaining'] : null;
+      } elseif ($type==='hold') {
+        $lr = limit_apply_operation($cid,'hold',$amt);
+        $limit_left = isset($lr['limit_remaining']) ? (float)$lr['limit_remaining'] : null;
+      }
+    }
+    try {
+      $lim = db_row("SELECT limit_cap_uah, limit_remaining_uah FROM cards WHERE id=?",[$cid]);
+      if ($lim){
+        $limit_cap = isset($lim['limit_cap_uah'])?(float)$lim['limit_cap_uah']:null;
+        if ($limit_left===null && isset($lim['limit_remaining_uah'])) $limit_left=(float)$lim['limit_remaining_uah'];
+      }
+    } catch(Throwable $e){}
+
+    // 2) баланс
+    if (!$skip_balance_limit_update) {
+      if ($type==='topup') {
+        db_exec("UPDATE `cards` SET `$bal_col` = IFNULL(`$bal_col`,0) + ? WHERE id = ?", [$amt, $cid]);
+      } elseif ($type==='debit') {
+        db_exec("UPDATE `cards` SET `$bal_col` = IFNULL(`$bal_col`,0) - ? WHERE id = ?", [$amt, $cid]);
+        try {
+          $rowTeam = db_row("SELECT t.id AS team_id FROM cards c JOIN buyers b ON b.id=c.buyer_id JOIN teams t ON t.id=b.team_id WHERE c.id=?", [$cid]);
+          if ($rowTeam && function_exists('fx_uah_to_usd')) {
+            $delta_usd = fx_uah_to_usd($amt);
+            db_exec("UPDATE teams SET balance_usd = IFNULL(balance_usd,0) - ? WHERE id = ?", [$delta_usd, (int)$rowTeam['team_id']]);
+          }
+        } catch (Throwable $e) {}
+      } else { // hold (возврат)
+        db_exec("UPDATE `cards` SET `$bal_col` = IFNULL(`$bal_col`,0) + ? WHERE id = ?", [$amt, $cid]);
+      }
+    }
+
+    // 3) запись в payments
+    try {
+      db_exec("INSERT INTO payments
+               (card_id, buyer_id_at_op, team_id_at_op, buyer_name_at_op, team_name_at_op, type, amount_uah, created_at)
+               VALUES (?,?,?,?,?,?,?,NOW())",
+               [$cid, $buyer_id_snap, $team_id_snap, $buyer_name_snap, $team_name_snap, $type, $amt]);
+      $payment_id = (int)db()->lastInsertId();
+      try { @db_exec("UPDATE payments SET sort_key = id WHERE id = ?", [$payment_id]); } catch (Throwable $e) {}
+
+    } catch(Throwable $e){ $payment_id = 0; }
+
+    // 4) уведомления + подготовка ответа
+    $last4 = '????'; $bal_after = null; $bankLabel = '—'; $buyerNm=''; $teamNm=''; $teamId=0;
+    try {
+      $card = db_row("SELECT c.*,
+                             b.id   AS buyer_id,
+                             b.name AS buyer_name,
+                             t.id   AS team_id,
+                             t.name AS team_name
+                        FROM cards c
+                   LEFT JOIN buyers b ON b.id=c.buyer_id
+                   LEFT JOIN teams  t ON t.id=b.team_id
+                       WHERE c.id=?", [$cid]);
+
+      $last4     = card_last4_from_row($card ?: []);
+      $bal_after = (float)db_cell("SELECT `$bal_col` FROM cards WHERE id=?", [$cid]);
+      $bankLabel = bank_label_from_row_local($card ?: []);
+
+      if ($limit_left === null) {
+        $lim = db_row("SELECT limit_cap_uah, limit_remaining_uah FROM cards WHERE id=?", [$cid]);
+        if ($lim) {
+          $limit_left = isset($lim['limit_remaining_uah']) ? (float)$lim['limit_remaining_uah'] : null;
+          $limit_cap  = isset($lim['limit_cap_uah']) ? (float)$lim['limit_cap_uah'] : $limit_cap;
+        }
+      }
+
+      $opLabel = ($type==='debit' ? 'Списание' : ($type==='hold' ? 'Холд (возврат)' : 'Пополнение'));
+      $sign    = ($type==='debit' ? '−' : '+');
+      $ts      = (new DateTime('now'))->format('d.m.Y H:i');
+      $buyerNm = trim((string)($card['buyer_name'] ?? ''));
+      $teamNm  = trim((string)($card['team_name'] ?? ''));
+      $teamId  = (int)($card['team_id'] ?? 0);
+
+      $headerTB = ($teamNm!=='' || $buyerNm!=='') ? "🏷 <b>{$teamNm}".($buyerNm!==''?' → '.$buyerNm:'')."</b>\n" : '';
+
+      $msg = "💳 <b>Карта</b> •••• {$last4}  |  <b>{$bankLabel}</b>\n"
+           . $headerTB
+           . "🔹 <b>Операция:</b> {$opLabel}\n"
+           . "💰 <b>Сумма:</b> {$sign}" . number_format($amt, 2, '.', ' ') . " грн\n"
+           . "🏦 <b>Баланс карты:</b> " . number_format($bal_after, 2, '.', ' ') . " грн\n"
+           . "🧮 <b>Остаток лимита:</b> " . ($limit_left !== null ? number_format((float)$limit_left, 2, '.', ' ') . " грн" : "—") . "\n"
+           . "🆔 <b>ID операции:</b> " . ($payment_id ?: '—') . "\n"
+           . "⏱ <b>Время:</b> {$ts}";
+
+      send_to_team_chats_local_by_card($cid, $msg);
+      if (function_exists('telegram_notify_buyer_by_card')) {
+        try { telegram_notify_buyer_by_card($cid, $msg); } catch(Throwable $e){}
+      }
+      if (function_exists('telegram_notify_admin')) {
+        try { telegram_notify_admin("👑 <b>ADMIN</b>\n".$msg); } catch (Throwable $e) {}
+      }
+
+      maybe_admin_alert_card_balance_low($cid, (float)$bal_after, $last4, $teamId, $teamNm);
+      maybe_admin_alert_card_limit_thresholds($cid, $limit_left, $limit_cap, $last4, $teamId, $teamNm);
+      if ($teamId > 0) { maybe_admin_alert_team_balance_low($teamId, $bal_col);
+      // Работник-chat immediate alerts (balance/limit below threshold)
+      @require_once __DIR__.'/../lib/tg_alerts.php';
+      try { tg_alerts_fire_immediate($cid, $bal_after, $limit_left); } catch (Throwable $e) {}
+ }
+
+    } catch (Throwable $e) {}
+
+    if ($IS_AJAX) {
+      json_out([
+        'ok'            => true,
+        'message'       => 'Операция применена',
+        'payment_id'    => $payment_id,
+        'card_id'       => $cid,
+        'type'          => $type,
+        'amount'        => $amt,
+        'balance_after' => $bal_after,
+        'limit_left'    => $limit_left,
+        'limit_cap'     => $limit_cap,
+        'team_id'       => $teamId,
+        'team_name'     => $teamNm,
+        'buyer_name'    => $buyerNm,
+        'last4'         => $last4,
+        'bank'          => $bankLabel,
+      ]);
+    }
+
+    set_flash('ok','Операция применена');
+    header('Location: '.$SELF); exit;
+  }
+
+  /* update note */
+  if (isset($_POST['update_note'])) {
+    $pid = (int)$_POST['payment_id'];
+    $note= trim((string)($_POST['note'] ?? ''));
+    try {
+      db_exec("UPDATE payments SET note=? WHERE id=?",[$note,$pid]);
+      if ($IS_AJAX) { json_out(['ok'=>true,'message'=>'Заметка сохранена']); }
+      set_flash('ok','Заметка сохранена');
+    } catch(Throwable $e){
+      if ($IS_AJAX) { json_out(['ok'=>false,'error'=>'Не удалось сохранить заметку']); }
+      set_flash('error','Не удалось сохранить заметку');
+    }
+    header('Location: '.$SELF); exit;
+  }
+
+  /* void payment */
+  if (isset($_POST['void_payment'])) {
+    $pid = (int)($_POST['payment_id'] ?? 0);
+
+    $row = db_row("SELECT * FROM payments WHERE id=?",[$pid]);
+    if (!$row){
+      if ($IS_AJAX) { json_out(['ok'=>false,'error'=>'Платёж не найден']); }
+      set_flash('error','Платёж не найден'); header('Location: '.$SELF); exit;
+    }
+    if ((int)$row['is_void']===1){
+      if ($IS_AJAX) { json_out(['ok'=>false,'error'=>'Платёж уже отменён']); }
+      set_flash('error','Платёж уже отменён'); header('Location: '.$SELF); exit;
+    }
+
+    $cid  = (int)$row['card_id'];
+    $type = (string)$row['type'];
+    $amt  = (float)$row['amount_uah'];
+
+    if (function_exists('limit_apply_operation')) {
+      if ($type==='debit') {
+        $lr = limit_apply_operation($cid,'hold',$amt);
+        if (!$lr['ok']) { if($IS_AJAX){ json_out(['ok'=>false,'error'=>$lr['error'] ?? 'Лимит: откат невозможен']); } set_flash('error',$lr['error'] ?? 'Лимит: откат невозможен'); header('Location: '.$SELF); exit; }
+      } elseif ($type==='hold') {
+        $lr = limit_apply_operation($cid,'debit',$amt);
+        if (!$lr['ok']) { if($IS_AJAX){ json_out(['ok'=>false,'error'=>$lr['error'] ?? 'Лимит: откат невозможен']); } set_flash('error',$lr['error'] ?? 'Лимит: откат невозможен'); header('Location: '.$SELF); exit; }
+      }
+    }
+
+    if ($type==='topup') {
+      db_exec("UPDATE cards SET `$bal_col` = IFNULL(`$bal_col`,0) - ? WHERE id = ?", [$amt, $cid]);
+    } elseif ($type==='debit') {
+      db_exec("UPDATE cards SET `$bal_col` = IFNULL(`$bal_col`,0) + ? WHERE id = ?", [$amt, $cid]);
+    }
+
+    try { db_exec("UPDATE payments SET is_void=1, voided_at=NOW() WHERE id=?",[$pid]); } catch(Throwable $e){}
+
+    try {
+      $card = db_row("SELECT * FROM cards WHERE id=?", [$cid]);
+      $last4 = card_last4_from_row($card?:[]);
+      $ts    = (new DateTime('now'))->format('d.m.Y H:i');
+
+      $buyerNm = trim((string)($row['buyer_name_at_op'] ?? ''));
+      $teamNm  = trim((string)($row['team_name_at_op']  ?? ''));
+      $opLabel = ($type==='debit' ? 'Списание' : ($type==='hold' ? 'Холд (возврат)' : 'Пополнение'));
+
+      $msgVoid = "❌ <b>Отмена операции</b>\n"
+               . "💳 Карта •••• {$last4}\n"
+               . (($teamNm!==''||$buyerNm!=='') ? "🏷 <b>{$teamNm}".($buyerNm!==''?' → '.$buyerNm:'')."</b>\n" : '')
+               . "🔹 <b>Тип:</b> {$opLabel}\n"
+               . "💰 <b>Сумма:</b> " . number_format($amt,2,'.',' ') . " грн\n"
+               . "🆔 <b>ID операции:</b> " . $pid . "\n"
+               . "⏱ <b>Время:</b> {$ts}";
+
+      send_to_team_chats_local_by_card($cid, $msgVoid);
+      if (function_exists('telegram_notify_buyer_by_card')) {
+        try { telegram_notify_buyer_by_card($cid, $msgVoid); } catch(Throwable $e){}
+      }
+      if (function_exists('telegram_notify_admin')) {
+        try { telegram_notify_admin("👑 <b>ADMIN</b>\n".$msgVoid); } catch(Throwable $e){}
+      }
+    } catch (Throwable $e) {}
+
+    if ($IS_AJAX) { json_out(['ok'=>true,'message'=>'Платёж отменён','payment_id'=>$pid]); }
+    set_flash('ok','Платёж отменён'); header('Location: '.$SELF); exit;
+  }
+
+  /* delete void payment */
+  if (isset($_POST['delete_payment'])) {
+    $pid = (int)($_POST['payment_id'] ?? 0);
+    $row = db_row("SELECT p.*, c.*,
+                          COALESCE(p.buyer_name_at_op, b.name) AS buyer_name,
+                          COALESCE(p.team_name_at_op,  t.name) AS team_name
+                     FROM payments p
+                LEFT JOIN cards  c ON c.id=p.card_id
+                LEFT JOIN buyers b ON b.id=c.buyer_id
+                LEFT JOIN teams  t ON t.id=b.team_id
+                    WHERE p.id=?", [$pid]);
+    if (!$row){
+      if ($IS_AJAX) { json_out(['ok'=>false,'error'=>'Платёж не найден']); }
+      set_flash('error','Платёж не найден'); header('Location: '.$SELF); exit;
+    }
+    if ((int)($row['is_void'] ?? 0) !== 1){
+      if ($IS_AJAX) { json_out(['ok'=>false,'error'=>'Удаление возможно только для void']); }
+      set_flash('error','Удаление возможно только для отменённых (void) операций');
+      header('Location: '.$SELF); exit;
+    }
+
+    try {
+      db_exec("DELETE FROM payments WHERE id=? AND is_void=1 LIMIT 1", [$pid]);
+      try {
+        $last4 = card_last4_from_row($row?:[]);
+        $op    = strtolower((string)($row['type'] ?? ''));
+        $amt   = (float)($row['amount_uah'] ?? 0);
+        $teamNm  = trim((string)($row['team_name'] ?? ''));
+        $buyerNm = trim((string)($row['buyer_name'] ?? ''));
+        $tb = ($teamNm!==''||$buyerNm!=='') ? "{$teamNm}".($buyerNm!==''?' → '.$buyerNm:'') : '';
+        $msgDel = "🗑 <b>Удалена операция (void)</b>\n"
+                . "💳 Карта •••• {$last4}\n"
+                . ($tb!=='' ? "🏷 <b>{$tb}</b>\n" : '')
+                . "🔹 <b>Тип:</b> " . h($op) . "\n"
+                . "💰 <b>Сумма:</b> " . number_format($amt,2,'.',' ') . " грн\n"
+                . "🆔 <b>ID операции:</b> {$pid}";
+        if (function_exists('telegram_notify_admin')) {
+          try { telegram_notify_admin("👑 <b>ADMIN</b>\n".$msgDel); } catch(Throwable $e){}
+        }
+      } catch (Throwable $e) {}
+      if ($IS_AJAX) { json_out(['ok'=>true,'message'=>'Операция удалена']); }
+      set_flash('ok','Операция полностью удалена');
+    } catch (Throwable $e) {
+      if ($IS_AJAX) { json_out(['ok'=>false,'error'=>'Не удалось удалить операцию']); }
+      set_flash('error','Не удалось удалить операцию');
+    }
+    header('Location: '.$SELF); exit;
+  }
+/* update date (day + month) */
+  if (isset($_POST['update_date'])) {
+    $pid = (int)($_POST['payment_id'] ?? 0);
+    $day = (int)($_POST['day'] ?? 0);
+    $mon = (int)($_POST['month'] ?? 0);
+    if ($pid<=0 || $day<=0 || $mon<=0 || $mon>12) {
+      if ($IS_AJAX) { json_out(['ok'=>false,'error'=>'Некорректные параметры даты']); }
+      set_flash('error','Некорректные параметры даты'); header('Location: '.$SELF); exit;
+    }
+    $row = db_row("SELECT id, card_id, type, is_void, created_at FROM payments WHERE id=?",[$pid]);
+    if (!$row) {
+      if ($IS_AJAX) { json_out(['ok'=>false,'error'=>'Платёж не найден']); }
+      set_flash('error','Платёж не найден'); header('Location: '.$SELF); exit;
+    }
+    if ((int)($row['is_void'] ?? 0) === 1) {
+      if ($IS_AJAX) { json_out(['ok'=>false,'error'=>'Операция void — редактирование даты запрещено']); }
+      set_flash('error','Операция void — редактирование даты запрещено'); header('Location: '.$SELF); exit;
+    }
+    // Determine target year: if selected month > current month => previous year
+    $nowY = (int)date('Y'); $nowM = (int)date('n');
+    $year = ($mon > $nowM) ? ($nowY - 1) : $nowY;
+    // Clamp day to days in month
+    $maxDay = (int)date('t', strtotime(sprintf('%04d-%02d-01', $year, $mon)));
+    if ($day > $maxDay) $day = $maxDay;
+    if ($day < 1) $day = 1;
+    // Preserve original time part
+    $timePart = '00:00:00';
+    if (!empty($row['created_at'])) {
+      $timePart = date('H:i:s', strtotime($row['created_at']));
+    }
+    $newDt = sprintf('%04d-%02d-%02d %s', $year, $mon, $day, $timePart);
+    try {
+      db_exec("UPDATE payments SET created_at=? WHERE id=?", [$newDt, $pid]);
+      // Recalculate card limit for current month
+      $cid = (int)($row['card_id'] ?? 0);
+      if ($cid > 0 && function_exists('limit_recalc_for_current_month')) {
+        @limit_recalc_for_current_month($cid);
+      } elseif ($cid > 0 && function_exists('limit_maybe_monthly_reset')) {
+        @limit_maybe_monthly_reset($cid);
+      }
+      if ($IS_AJAX) { json_out(['ok'=>true,'message'=>'Дата операции обновлена','new_date'=>$newDt]); }
+      set_flash('ok','Дата операции обновлена');
+    } catch (Throwable $e) {
+      if ($IS_AJAX) { json_out(['ok'=>false,'error'=>'Не удалось обновить дату операции']); }
+      set_flash('error','Не удалось обновить дату операции');
+    }
+    header('Location: '.$SELF); exit;
+  }
+
+}
+
+/* ---------- DATA ---------- */
+$cards = cards_for_operations();
+/* Список команд для плиток/экспорта (активные) */
+$teams = db_exec("SELECT id,name FROM teams WHERE IFNULL(is_archived,0)=0 ORDER BY name")->fetchAll();
+
+/* Балансы команд (остаток в UAH) — для отображения на плитках */
+$__team_balances = [];
+if (function_exists('team_balance_calc')) {
+  foreach ($teams as $tt) {
+    $tid = (int)$tt['id'];
+    try {
+      $calc = team_balance_calc($tid, '', '', true);
+      $__team_balances[$tid] = (float)($calc['remain_uah'] ?? 0.0);
+    } catch (Throwable $e) { $__team_balances[$tid] = 0.0; }
+  }
+}
+
+/* Индексы для фронта */
+$teamCardCount = [];
+$cardsForJs = [];
+foreach ($cards as $c) {
+  $team_id = (int)($c['team_id'] ?? 0);
+  $teamCardCount[$team_id] = ($teamCardCount[$team_id] ?? 0) + 1;
+  $last4  = card_last4_from_row($c);
+
+  $cap = isset($c['limit_cap_uah']) ? (float)$c['limit_cap_uah'] : 0.0;
+  $left = null;
+  if (array_key_exists('limit_remaining_uah', $c)) {
+    if ($c['limit_remaining_uah'] === null && $cap>0) { $left = $cap; }
+    else { $left = $c['limit_remaining_uah'] !== null ? (float)$c['limit_remaining_uah'] : null; }
+  }
+  $pct = ($cap>0 && $left !== null) ? max(0, min(100, (int)round($left/$cap*100))) : 0;
+
+  $cardsForJs[] = [
+    'id'         => (int)$c['id'],
+    'team_id'    => $team_id,
+    'team'       => (string)($c['team_name'] ?? ''),
+    'buyer'      => (string)($c['buyer_name'] ?? ''),
+    'last4'      => $last4,
+    'masked'     => trim(bank_label_from_row_local($c).' '.( ($b=card_brand_from_row_local($c))!=='—' ? $b : '' )) . ($last4 ? ' • '.$last4 : ''),
+    'bank'       => bank_label_from_row_local($c),
+    'balance'    => isset($c[$bal_col]) ? (float)$c[$bal_col] : 0.0,
+    'limit_cap'  => $cap,
+    'limit_left' => $left,
+    'limit_pct'  => $pct,
+  ];
+}
+
+require __DIR__.'/_layout.php';
+?>
+<div class="content">
+
+  <?php include __DIR__.'/_flash.php'; ?>
+
+  <style>
+    /* ---------- плитки и новые экраны ---------- */
+    .tiles-grid {
+      display: grid;
+      grid-template-columns: repeat( auto-fill, minmax(260px, 1fr) );
+      gap: 12px;
+    }
+    .tile {
+      display: grid;
+      gap: 8px;
+      padding: 14px;
+      border: 1px solid #222;
+      border-radius: 12px;
+      background: var(--panel, #0f131a);
+      box-shadow: 0 6px 18px rgba(0,0,0,.22);
+      cursor: pointer;
+      transition: transform .06s ease, box-shadow .12s ease, border-color .12s ease;
+      text-align: left;
+    }
+    .tile:hover { transform: translateY(-1px); box-shadow: 0 8px 22px rgba(0,0,0,.28); border-color:#2c2c2c; }
+    .tile .t-title { font-weight: 600; font-size: 16px; }
+    .tile .t-sub { color: var(--muted, #8b93a7); font-size: 12px; }
+    .tile .t-balance { font-variant-numeric: tabular-nums; font-weight:600; }
+
+    .toolbar { display:flex; gap:8px; align-items:center; flex-wrap: wrap; }
+    .breadcrumbs { color: var(--muted, #8b93a7); font-size: 12px; margin: 6px 0 12px; }
+    .hidden { display:none !important; }
+    .btn-ghost { background: transparent; border: 1px dashed #333; color: #bbb; }
+    .segmented {
+      display: inline-grid; grid-auto-flow: column; gap: 6px; background:#0b0f15; padding: 6px; border-radius: 12px; border:1px solid #1f2430;
+    }
+    .segmented .seg {
+      padding: 8px 12px; border-radius: 8px; border:1px solid transparent; cursor:pointer; user-select:none;
+    }
+    .segmented .seg.active { background:#121826; border-color:#2a3242; }
+
+    /* Прогресс лимита как в cards.php */
+    .progress-box{width:100%;height:10px;background:#1f2937;border-radius:6px;overflow:hidden}
+    .limit-text{font-size:12px;color:#94a3b8;margin-top:6px}
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+
+    .mt8{margin-top:8px}.mt12{margin-top:12px}.mt16{margin-top:16px}.mt24{margin-top:24px}
+    .mb0{margin-bottom:0}
+
+    /* Toast (прозрачный) */
+    .toast{
+      position:fixed; right:18px; bottom:18px;
+      padding:12px 16px; border-radius:12px;
+      background:rgba(15,19,26,.78); color:#e9efff;
+      border:1px solid rgba(255,255,255,.08);
+      box-shadow:0 10px 28px rgba(0,0,0,.35);
+      backdrop-filter: blur(8px) saturate(120%);
+      z-index:2000; opacity:0; transform:translateY(8px) scale(.98);
+      pointer-events:none; transition:opacity .18s ease, transform .18s ease;
+    }
+    .toast.show{ opacity:1; transform:translateY(0) scale(1); }
+    .toast.ok{ border-color:rgba(34,197,94,.55); }
+    .toast.err{ border-color:rgba(239,68,68,.55); }
+
+    /* Виджет баланса команды */
+    .team-stats { display:flex; align-items:center; justify-content:flex-start; gap:12px; margin-top:8px; margin-bottom:8px; }
+    .team-balance-badge{
+      display:flex; align-items:baseline; gap:10px; padding:12px 14px;
+      border-radius:12px; border:1px solid #1f2430; box-shadow:0 6px 18px rgba(0,0,0,.22);
+      background:#0b0f15;
+    }
+    .team-balance-badge .label{ color:#aeb6c6; font-size:12px; text-transform:uppercase; letter-spacing:.03em; }
+    .team-balance-badge .value{ font-weight:700; font-size:20px; }
+
+    /* Цветовые состояния */
+    .tb-ok   { background:linear-gradient(180deg, rgba(34,197,94,.18), rgba(34,197,94,.08));  border-color:rgba(34,197,94,.35); }
+    .tb-mid  { background:linear-gradient(180deg, rgba(234,179,8,.18), rgba(234,179,8,.08));  border-color:rgba(234,179,8,.35); }
+    .tb-low  { background:linear-gradient(180deg, rgba(249,115,22,.18), rgba(249,115,22,.08)); border-color:rgba(249,115,22,.35); }
+    .tb-crit { background:linear-gradient(180deg, rgba(239,68,68,.18), rgba(239,68,68,.08));  border-color:rgba(239,68,68,.35); }
+
+    /* мобильные карточки истории — перенос из старого кода (без изменений) */
+    @media (max-width: 980px) {
+      .card > .table-wrap { overflow: visible; }
+      table.table-ops { display: block; border: 0; min-width: 0 !important; }
+      table.table-ops thead { display: none; }
+      table.table-ops tbody { display: grid; gap: 12px; }
+      table.table-ops tbody tr {
+        display: grid; grid-template-columns: 1fr;
+        background: var(--panel, #0f131a); border: 1px solid #222; border-radius: 12px; padding: 12px; box-shadow: 0 6px 18px rgba(0,0,0,.25);
+      }
+      table.table-ops tbody tr > td {
+        display: grid; grid-template-columns: auto 1fr; gap: 8px; padding: 6px 0; border: 0; vertical-align: top;
+      }
+      table.table-ops tbody tr > td::before {
+        content: ''; color: var(--muted, #8b93a7); font-size: 12px; line-height: 1.2; padding-top: 4px; white-space: nowrap;
+      }
+      table.table-ops tbody tr > td:nth-child(1)::before { content: "ID"; }
+      table.table-ops tbody tr > td:nth-child(2)::before { content: "Дата"; }
+      table.table-ops tbody tr > td:nth-child(3)::before { content: "Карта"; }
+      table.table-ops tbody tr > td:nth-child(4)::before { content: "Команда → Баер"; }
+      table.table-ops tbody tr > td:nth-child(5)::before { content: "Тип"; }
+      table.table-ops tbody tr > td:nth-child(6)::before { content: "Сумма UAH"; }
+      table.table-ops tbody tr > td:nth-child(7)::before { content: "Заметка"; }
+      table.table-ops tbody tr > td:nth-child(8)::before { content: "Действие"; }
+      .table-ops .form-row { gap: 8px !important; flex-wrap: wrap; }
+      .table-ops input[type="text"] { width: 100%; min-width: 0 !important; }
+      .table-ops .btn { min-height: 44px; }
+      .table-ops .td-actions { display: flex; align-items: center; justify-content: flex-start; }
+      .table-ops .td-actions form { width: 100%; }
+      .table-ops .td-actions .btn-danger { width: 44px; height: 44px; line-height: 1; font-size: 20px; padding: 0; }
+      .table-ops .td-mono { word-break: break-word; }
+      .table-ops tr[style*="opacity:.55"] { border-style:dashed; }
+    }
+    @media (min-width: 981px) and (max-width: 1200px) {
+      .card > .table-wrap { overflow: auto; -webkit-overflow-scrolling: touch; }
+      .table-ops thead th { position: sticky; top: 0; background: #0f131a; z-index: 1; }
+    }
+  
+      /* move controls */
+      .table-ops .id-cell { display:flex; align-items:center; gap:6px; }
+      .table-ops .id-cell .id-val { min-width:42px; text-align:right; }
+      .table-ops .move-btns { display:flex; flex-direction:column; gap:2px; }
+      .table-ops .btn.btn-xs { padding:0 6px; height:20px; line-height:18px; font-size:12px; }
+
+    /* --- сортировка по клику в таблицах истории --- */
+    table.table-ops th.sortable { cursor: pointer; user-select: none; }
+    table.table-ops th.sortable:focus { outline: none; text-decoration: underline; }
+    table.table-ops th[aria-sort="ascending"]::after { content: ' ▲'; opacity: .7; }
+    table.table-ops th[aria-sort="descending"]::after { content: ' ▼'; opacity: .7; }
+</style>
+
+  <!-- ===========================
+       ЭКРАН 1: Команды (плитки)
+       =========================== -->
+  <div id="view-teams" class="card">
+    <div class="card-body">
+      <div class="toolbar">
+        <h2 class="mb0">Команды</h2>
+      </div>
+      <div class="muted-sm mt8">Выберите команду, чтобы увидеть привязанные карты и быстро вносить операции.</div>
+
+      <div id="teamsGrid" class="tiles-grid mt16">
+        <?php foreach ($teams as $t): ?>
+          <?php $cnt = (int)($teamCardCount[(int)$t['id']] ?? 0); ?>
+          <button class="tile" data-team-id="<?= (int)$t['id'] ?>" onclick="openTeam(<?= (int)$t['id'] ?>)">
+            <div class="t-title"><?= h($t['name']) ?></div>
+            <div class="t-sub">ID #<?= (int)$t['id'] ?> · Карт: <?= $cnt ?></div>
+          </button>
+        <?php endforeach; if (empty($teams)): ?>
+          <div class="muted">Нет активных команд.</div>
+        <?php endif; ?>
+      </div>
+
+      <details class="mt16">
+        <summary>Экспорт TXT по команде / периоду</summary>
+        <form method="post" action="/admin/payments.php" class="form-row" style="gap:12px; align-items:flex-end; margin-top:12px">
+          <?= csrf_field(); ?>
+          <input type="hidden" name="export_team_txt" value="1">
+          <label>Команда
+            <select name="team_id" required id="exportTeamSelect">
+              <option value="">— выберите команду —</option>
+              <?php foreach ($teams as $t): ?>
+                <option value="<?= (int)$t['id'] ?>"><?= h($t['name']) ?></option>
+              <?php endforeach; ?>
+            </select>
+          </label>
+          <label>С даты
+            <input type="date" name="date_from" value="<?= h(date('Y-m-01')) ?>">
+          </label>
+          <label>По дату
+            <input type="date" name="date_to" value="<?= h(date('Y-m-d')) ?>">
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;margin:0 8px;">
+            <input type="checkbox" name="include_void" value="1"> Включать void
+          </label>
+          <button class="btn btn-primary" type="submit">Экспорт TXT</button>
+        </form>
+      </details>
+    </div>
+  </div>
+
+  <!-- ===========================
+       ЭКРАН 2: Карты команды
+       =========================== -->
+  <div id="view-cards" class="card hidden">
+    <div class="card-body">
+      <div class="toolbar">
+        <button class="btn" type="button" onclick="backToTeams()">← Все команды</button>
+        <h2 id="teamTitle" class="mb0"></h2>
+      </div>
+      <div class="breadcrumbs" id="teamMeta"></div>
+
+      <!-- Вынесенный баланс команды -->
+      <div class="team-stats">
+        <div id="teamBalanceBox" class="team-balance-badge tb-ok" role="status" aria-live="polite">
+          <div class="label">Баланс команды</div>
+          <div class="value mono" id="teamBalanceValue">— грн</div>
+        </div>
+      </div>
+
+      <div class="tiles-grid mt12" id="cardsGrid"></div>
+
+      <details class="mt16" open>
+        <summary>История (последние 100) — по команде</summary>
+        <div class="form-row" style="gap:12px; align-items:flex-end; margin-top:12px">
+          <label>Тип
+            <select id="opFilterTypeTeam" onchange="filterOps('opsBodyTeam','opFilterTypeTeam','opFilterSearchTeam')">
+              <option value="all">Все</option>
+              <option value="topup">Пополнение</option>
+              <option value="debit">Списание</option>
+              <option value="hold">Холд</option>
+              <option value="void">Void</option>
+            </select>
+          </label>
+          <label style="flex:1">Поиск (ID / last4 / Команда / Баер / Заметка)
+            <input id="opFilterSearchTeam" placeholder="Начните ввод..." oninput="filterOps('opsBodyTeam','opFilterTypeTeam','opFilterSearchTeam')" autocomplete="off">
+          </label>
+          <button class="btn" type="button" onclick="clearOpFilters('opsBodyTeam','opFilterTypeTeam','opFilterSearchTeam')">Сбросить</button>
+        </div>
+        <div class="table-wrap">
+          <table class="table table-ops">
+            <thead>
+  <tr>
+    <th class="num sortable" data-sort="id" role="button" tabindex="0">ID</th>
+    <th class="sortable" data-sort="created" role="button" tabindex="0">Дата</th>
+    <th class="sortable" data-sort="card" role="button" tabindex="0">Карта</th>
+    <th class="sortable" data-sort="tb" role="button" tabindex="0">Команда → Баер</th>
+    <th class="sortable" data-sort="type" role="button" tabindex="0">Тип</th>
+    <th class="num sortable" data-sort="amount" role="button" tabindex="0">Сумма UAH</th>
+    <th class="sortable" data-sort="note" role="button" tabindex="0">Заметка</th>
+    <th class="num">Отмена</th>
+  </tr>
+</thead>
+            <tbody id="opsBodyTeam"></tbody>
+          </table>
+        </div>
+      </details>
+
+      <details class="mt16">
+        <summary>Экспорт TXT по этой команде</summary>
+        <form method="post" action="/admin/payments.php" class="form-row" style="gap:12px; align-items:flex-end; margin-top:12px">
+          <?= csrf_field(); ?>
+          <input type="hidden" name="export_team_txt" value="1">
+          <input type="hidden" name="team_id" id="exportTeamHidden">
+          <label>С даты
+            <input type="date" name="date_from" value="<?= h(date('Y-m-01')) ?>">
+          </label>
+          <label>По дату
+            <input type="date" name="date_to" value="<?= h(date('Y-m-d')) ?>">
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;margin:0 8px;">
+            <input type="checkbox" name="include_void" value="1"> Включать void
+          </label>
+          <button class="btn btn-primary" type="submit">Экспорт TXT</button>
+        </form>
+      </details>
+    </div>
+  </div>
+
+  <!-- ===========================
+       ЭКРАН 3: Операции по карте
+       =========================== -->
+  <div id="view-card-ops" class="card hidden">
+    <div class="card-body">
+      <div class="toolbar">
+        <button class="btn" type="button" onclick="backToCards()">← Карты команды</button>
+        <h2 id="cardTitle" class="mb0"></h2>
+      </div>
+      <div class="breadcrumbs" id="cardMeta"></div>
+
+      <div class="form-row" style="gap:12px; align-items:flex-end">
+        <div class="segmented" role="tablist" aria-label="Тип операции">
+          <div class="seg active" data-type="debit"  role="tab" aria-selected="true"  onclick="setOpType('debit')" title="Списание">Списание</div>
+          <div class="seg"        data-type="topup"  role="tab" aria-selected="false" onclick="setOpType('topup')" title="Пополнение">Пополнение</div>
+          <div class="seg"        data-type="hold"   role="tab" aria-selected="false" onclick="setOpType('hold')"  title="Холд">Холд</div>
+        </div>
+
+        <label style="flex:1">Сумма, грн
+          <input id="amountInput" type="number" step="0.01" min="0.01" placeholder="Например, 1000" autocomplete="off">
+        </label>
+
+        <button class="btn btn-primary" type="button" id="quickOkBtn" onclick="quickSubmit()" aria-label="Применить операцию">ОК</button>
+      </div>
+
+      <div class="mt8 muted-sm">
+        Подсказка: нажмите <span class="mono">Enter</span>, чтобы применить сумму.
+      </div>
+
+      <!-- Инфо по карте -->
+      <div class="mt16">
+        <div class="muted-sm">Инфо по карте:</div>
+        <div id="cardInfo" class="mono"></div>
+      </div>
+
+      <!-- Лимит (остаток) по карте -->
+      <div class="mt16">
+        <div class="muted-sm">Лимит (остаток)</div>
+        <div class="progress-box"><div id="cardLimitBar" style="width:0;height:100%;background:#22c55e;"></div></div>
+        <div class="limit-text">Остаток: <span id="cardLimitLeftText">—</span> (cap <span id="cardLimitCapText">—</span>)</div>
+      </div>
+
+      <!-- История по карте -->
+      <div class="mt24">
+        <details open>
+          <summary>История (последние 100) — по карте</summary>
+          <div class="form-row" style="gap:12px; align-items:flex-end; margin-top:12px">
+            <label>Тип
+              <select id="opFilterTypeCard" onchange="filterOps('opsBodyCard','opFilterTypeCard','opFilterSearchCard')">
+                <option value="all">Все</option>
+                <option value="topup">Пополнение</option>
+                <option value="debit">Списание</option>
+                <option value="hold">Холд</option>
+                <option value="void">Void</option>
+              </select>
+            </label>
+            <label style="flex:1">Поиск (ID / last4 / Команда / Баер / Заметка)
+              <input id="opFilterSearchCard" placeholder="Начните ввод..." oninput="filterOps('opsBodyCard','opFilterTypeCard','opFilterSearchCard')" autocomplete="off">
+            </label>
+            <button class="btn" type="button" onclick="clearOpFilters('opsBodyCard','opFilterTypeCard','opFilterSearchCard')">Сбросить</button>
+          </div>
+          <div class="table-wrap">
+            <table class="table table-ops">
+              <thead>
+  <tr>
+    <th class="num sortable" data-sort="id" role="button" tabindex="0">ID</th>
+    <th class="sortable" data-sort="created" role="button" tabindex="0">Дата</th>
+    <th class="sortable" data-sort="card" role="button" tabindex="0">Карта</th>
+    <th class="sortable" data-sort="tb" role="button" tabindex="0">Команда → Баер</th>
+    <th class="sortable" data-sort="type" role="button" tabindex="0">Тип</th>
+    <th class="num sortable" data-sort="amount" role="button" tabindex="0">Сумма UAH</th>
+    <th class="sortable" data-sort="note" role="button" tabindex="0">Заметка</th>
+    <th class="num">Отмена</th>
+  </tr>
+</thead>
+              <tbody id="opsBodyCard"></tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Тост -->
+<div id="toast" class="toast ok" role="status" aria-live="polite"></div>
+
+<script>
+  // ------- данные для фронта -------
+  const DATA = {
+    teams: <?= json_encode(array_map(fn($t)=>['id'=>(int)$t['id'],'name'=>$t['name'],'balance_uah'=>(float)($__team_balances[(int)$t['id']] ?? 0.0)], $teams), JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) ?>,
+    cards: <?= json_encode($cardsForJs, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) ?>,
+    csrf:  <?= json_encode(csrf_token(), JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) ?>,
+    self:  <?= json_encode($SELF, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) ?>,
+  };
+
+  // ------- состояние -------
+  let currentTeamId = null;
+  let currentCardId = null;
+  let currentOpType = localStorage.getItem('payments.opType') || 'debit';
+
+  // ------- утилиты UI -------
+  function $(sel){ return document.querySelector(sel); }
+  function show(id){ document.getElementById(id)?.classList.remove('hidden'); }
+  function hide(id){ document.getElementById(id)?.classList.add('hidden'); }
+  function fmtUah(x){ return (Number(x||0)).toLocaleString('ru-RU', {minimumFractionDigits:2, maximumFractionDigits:2}); }
+  function fmtInt(x){ return (Number(x||0)).toLocaleString('ru-RU', {maximumFractionDigits:0}); }
+  function barColorByPct(pct){
+    if (pct>60) return '#22c55e';
+    if (pct>=30) return '#eab308';
+    if (pct>=10) return '#f97316';
+    return '#ef4444';
+  }
+
+  // Цветовая классификация для баланса команды
+  function teamBalanceClass(uah){
+    if (uah >= 100000) return 'tb-ok';
+    if (uah >= 50000)  return 'tb-mid';
+    if (uah >= 20000)  return 'tb-low';
+    return 'tb-crit';
+  }
+  function updateTeamBalanceUI(uah){
+    const box = $('#teamBalanceBox');
+    const val = $('#teamBalanceValue');
+    if (!box || !val) return;
+    val.textContent = fmtUah(uah) + ' грн';
+    box.classList.remove('tb-ok','tb-mid','tb-low','tb-crit');
+    box.classList.add(teamBalanceClass(uah));
+  }
+
+  // Toast (прозрачный уголок)
+  const toastEl = document.getElementById('toast');
+  let toastTimer = null;
+  function showToast(msg, isErr=false){
+    if(!toastEl) return;
+    toastEl.textContent = msg || (isErr ? 'Ошибка' : 'Готово');
+    toastEl.classList.remove('err','ok');
+    toastEl.classList.add(isErr ? 'err' : 'ok');
+    toastEl.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(()=>toastEl.classList.remove('show'), 2000);
+  }
+
+  // ------- Рендер команд и карт -------
+  function openTeam(teamId){
+    currentTeamId = teamId;
+    localStorage.setItem('payments.teamId', String(teamId));
+    const team = DATA.teams.find(t=>t.id===teamId);
+    $('#teamTitle').textContent = team ? team.name : ('Команда #'+teamId);
+    $('#teamMeta').textContent  = 'ID #' + teamId;
+    $('#exportTeamHidden').value = teamId;
+    const expSelect = document.getElementById('exportTeamSelect'); if (expSelect) expSelect.value = String(teamId);
+
+    // Обновим отдельный виджет баланса команды
+    updateTeamBalanceUI((team?.balance_uah) || 0);
+
+    // Рендер карт
+    const cards = DATA.cards.filter(c=>c.team_id===teamId);
+    const grid = $('#cardsGrid'); grid.innerHTML='';
+    if (!cards.length) {
+      grid.innerHTML = '<div class="muted">У этой команды нет активных карт.</div>';
+    } else {
+      for (const c of cards) {
+        const pct = (c.limit_cap>0 && c.limit_left!=null) ? Math.max(0, Math.min(100, Math.round(c.limit_left/c.limit_cap*100))) : 0;
+        const color = barColorByPct(pct);
+        const leftTxt = (c.limit_left!=null) ? fmtUah(c.limit_left) + ' грн' : '—';
+        const capTxt  = (c.limit_cap>0) ? fmtInt(c.limit_cap) : '—';
+
+        const el = document.createElement('button');
+        el.className = 'tile';
+        el.innerHTML = `
+          <div class="t-title">${c.masked}</div>
+          <div class="t-sub">${escapeHtml(c.team)}${c.buyer ? ' → '+escapeHtml(c.buyer):''}</div>
+          <div class="t-sub">Банк: ${escapeHtml(c.bank)}</div>
+          <div class="t-balance">Баланс: <span class="mono" id="bal_${c.id}">${fmtUah(c.balance)}</span> грн</div>
+          <div class="t-sub">Лимит (остаток)</div>
+          <div class="progress-box"><div id="limit_bar_${c.id}" style="width:${pct}%;height:100%;background:${color};"></div></div>
+          <div class="limit-text">Остаток: <span id="limit_left_text_${c.id}">${leftTxt}</span> (cap <span id="limit_cap_text_${c.id}">${capTxt}</span>)</div>`;
+        el.onclick = ()=>openCard(c.id);
+        grid.appendChild(el);
+      }
+    }
+
+    hide('view-teams'); hide('view-card-ops'); show('view-cards');
+    // загрузим историю команды
+    loadHistory('team', teamId, 'opsBodyTeam');
+  }
+  function backToTeams(){
+    hide('view-cards'); hide('view-card-ops'); show('view-teams');
+    currentTeamId = null; currentCardId=null;
+  }
+  function backToCards(){
+    hide('view-card-ops'); show('view-cards');
+    currentCardId = null;
+  }
+  function openCard(cardId){
+    currentCardId = cardId;
+    localStorage.setItem('payments.cardId', String(cardId));
+    const card = DATA.cards.find(c=>c.id===cardId);
+    if (!card){ showToast('Карта не найдена', true); return; }
+    $('#cardTitle').textContent = card.masked;
+    $('#cardMeta').textContent  = `${card.team}${card.buyer ? ' → '+card.buyer:''} • Банк: ${card.bank}`;
+    $('#cardInfo').textContent  = `ID карты: ${card.id} | Баланс: ${fmtUah(card.balance)} грн`;
+
+    // Лимит
+    updateCardLimitUI(card.limit_left, card.limit_cap);
+
+    // активировать тип
+    setOpType(currentOpType, /*silent=*/true);
+
+    hide('view-cards'); show('view-card-ops');
+    setTimeout(()=>$('#amountInput')?.focus(), 50);
+
+    // история по карте
+    loadHistory('card', cardId, 'opsBodyCard');
+  }
+
+  // ------- быстрые операции -------
+  function setOpType(t, silent){
+    currentOpType = t;
+    localStorage.setItem('payments.opType', t);
+    document.querySelectorAll('.segmented .seg').forEach(seg=>{
+      const on = seg.getAttribute('data-type')===t;
+      seg.classList.toggle('active', on);
+      seg.setAttribute('aria-selected', on?'true':'false');
+    });
+    if (!silent) { $('#amountInput')?.focus(); }
+  }
+
+  async function quickSubmit(){
+    if (!currentCardId){ showToast('Сначала выберите карту', true); return; }
+    const i = $('#amountInput');
+    let val = (i.value||'').trim().replace(',','.');
+    let amt = parseFloat(val);
+    if (!amt || amt<=0){ showToast('Введите сумму > 0', true); i.focus(); return; }
+
+    const btn = $('#quickOkBtn');
+    btn.disabled = true;
+
+    try{
+      const fd = new FormData();
+      fd.append('csrf', DATA.csrf);
+      fd.append('ajax', '1');
+      fd.append('add_payment', '1');
+      fd.append('card_id', String(currentCardId));
+      fd.append('type', currentOpType);
+      fd.append('amount_uah', String(amt));
+
+      const res = await fetch(DATA.self, { method:'POST', body: fd, credentials:'same-origin' });
+      const j = await res.json();
+      if (!j.ok) { throw new Error(j.error || 'Ошибка'); }
+
+      // обновим баланс на карточке (и в DATA) + баланс команды
+      const card = DATA.cards.find(c=>c.id===currentCardId);
+      const team = DATA.teams.find(t=>t.id===currentTeamId);
+      if (card && typeof j.balance_after !== 'undefined') {
+        const prev = Number(card.balance || 0);
+        card.balance = Number(j.balance_after || 0);
+
+        const bEl = document.getElementById('bal_'+card.id);
+        if (bEl) bEl.textContent = fmtUah(card.balance);
+        $('#cardInfo').textContent = `ID карты: ${card.id} | Баланс: ${fmtUah(card.balance)} грн`;
+
+        // дельта идёт в баланс команды
+        if (team) {
+          team.balance_uah = Number(team.balance_uah || 0) + (card.balance - prev);
+          updateTeamBalanceUI(team.balance_uah);
+        }
+      }
+
+      // обновим лимит (если есть в ответе)
+      if (j.limit_cap !== null && typeof j.limit_left !== 'undefined') {
+        const left = (j.limit_left===null ? null : Number(j.limit_left));
+        const cap  = (j.limit_cap===null ? 0 : Number(j.limit_cap));
+        if (card){ card.limit_left = left; card.limit_cap = cap; }
+        updateCardLimitUI(left, cap);
+        // апдейт плитки в списке карт
+        const pct = (cap>0 && left!==null) ? Math.max(0, Math.min(100, Math.round(left/cap*100))) : 0;
+        const color = barColorByPct(pct);
+        const barEl = document.getElementById('limit_bar_'+currentCardId);
+        const leftEl= document.getElementById('limit_left_text_'+currentCardId);
+        const capEl = document.getElementById('limit_cap_text_'+currentCardId);
+        if (barEl){ barEl.style.width = pct + '%'; barEl.style.background = color; }
+        if (leftEl){ leftEl.textContent = (left!==null? fmtUah(left)+' грн' : '—'); }
+        if (capEl){ capEl.textContent  = (cap>0? fmtInt(cap) : '—'); }
+      }
+
+      // красивый тост
+      const map = {debit:'Списание', topup:'Пополнение', hold:'Холд'};
+      const sign = (j.type==='debit' ? '−' : '+');
+      showToast(`${map[j.type]||'Операция'}: ${sign}${fmtUah(j.amount)} грн`, false);
+
+
+      // мгновенно перезагрузим историю по карте и, если сортировка ещё не задана пользователем,
+      // выставим по умолчанию "Дата ↓" (новые сверху)
+      try {
+        await loadHistory('card', currentCardId, 'opsBodyCard');
+        // если открыт раздел команды — обновим и его
+        if (typeof currentTeamId !== 'undefined' && currentTeamId) {
+          try { await loadHistory('team', currentTeamId, 'opsBodyTeam'); } catch(e) {}
+        }
+        const key = getSortPrefKey ? getSortPrefKey('opsBodyCard') : null;
+        if (key && !localStorage.getItem(key)) {
+          sortOpsTable('opsBodyCard', 'created', 'descending', /*save=*/true);
+        }
+      } catch(e) { console.warn('history reload failed', e); }
+
+            i.value=''; i.focus(); // мгновенный повтор ввода
+    } catch(e){
+      console.error(e);
+      showToast(e.message || 'Ошибка', true);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function updateCardLimitUI(left, cap){
+    const bar = $('#cardLimitBar');
+    const leftText = $('#cardLimitLeftText');
+    const capText  = $('#cardLimitCapText');
+    if (cap>0 && left!==null){
+      const pct = Math.max(0, Math.min(100, Math.round(left/cap*100)));
+      bar.style.width = pct + '%';
+      bar.style.background = barColorByPct(pct);
+      leftText.textContent = fmtUah(left) + ' грн';
+      capText.textContent  = fmtInt(cap);
+    } else {
+      bar.style.width = '0%';
+      bar.style.background = '#22c55e';
+      leftText.textContent = '—';
+      capText.textContent  = '—';
+    }
+  }
+
+  // ------- История (команда/карта) -------
+  async function loadHistory(scope, id, tbodyId){
+    const tb = document.getElementById(tbodyId);
+    if (!tb) return;
+    tb.innerHTML = '<tr><td colspan="8" class="muted">Загрузка…</td></tr>';
+    try{
+      const fd = new FormData();
+      fd.append('csrf', DATA.csrf);
+      fd.append('ajax','1');
+      fd.append('fetch_history','1');
+      fd.append('scope', scope);
+      fd.append('id', String(id));
+      fd.append('limit','100');
+      const res = await fetch(DATA.self, { method:'POST', body: fd, credentials:'same-origin' });
+      const j = await res.json();
+      if (!j.ok) throw new Error(j.error||'Ошибка загрузки');
+      tb.innerHTML = j.html || '<tr><td colspan="8" class="muted">Нет операций</td></tr>';
+            try { applySavedSort(tbodyId); } catch(e) {}
+// re-apply current filters after reload
+      try {
+        if (tbodyId==='opsBodyTeam') { filterOps('opsBodyTeam','opFilterTypeTeam','opFilterSearchTeam'); }
+        if (tbodyId==='opsBodyCard') { filterOps('opsBodyCard','opFilterTypeCard','opFilterSearchCard'); }
+      } catch(e){}
+      // attach reorder buttons
+      try {
+        const btns = tb.querySelectorAll('button[data-move]');
+        btns.forEach(btn=>{
+          btn.addEventListener('click', async (ev)=>{
+            ev.preventDefault();
+            const pid = btn.getAttribute('data-id');
+            const dir = btn.getAttribute('data-move');
+            // Move row in DOM without reload, then persist whole order
+            const tr = btn.closest('tr');
+            if (tr) {
+              if (dir==='up' && tr.previousElementSibling) {
+                tb.insertBefore(tr, tr.previousElementSibling);
+              } else if (dir==='down' && tr.nextElementSibling) {
+                tb.insertBefore(tr.nextElementSibling, tr);
+              }
+              try { await saveOrderFromDOM(tb, scope, id); } catch(e){}
+              return;
+            }
+            if (!pid || !dir) return;
+            btn.disabled = true;
+            try{
+              const fd2 = new FormData();
+              fd2.append('csrf', DATA.csrf);
+              fd2.append('ajax','1');
+              fd2.append('reorder_payment','1');
+              fd2.append('payment_id', pid);
+              fd2.append('direction', dir);
+              fd2.append('scope', scope);
+              fd2.append('id', String(id));
+              const res2 = await fetch(DATA.self, { method:'POST', body: fd2, credentials:'same-origin' });
+              const j2 = await res2.json();
+              if (!j2.ok) { showToast(j2.error || 'Не удалось поменять порядок', true); }
+              else { showToast('Порядок обновлён'); }
+              // reload history
+              await saveOrderFromDOM(tb, scope, id);
+            }catch(e){ showToast('Ошибка запроса', true); }
+            finally { btn.disabled = false; }
+          });
+        });
+      } catch (ex) {}
+      try { attachDnD(tb, scope, id, tbodyId); } catch (e) {}
+    }catch(e){
+      tb.innerHTML = '<tr><td colspan="8" class="muted">Ошибка загрузки</td></tr>';
+    }
+  }
+
+  // ------- фильтры таблиц истории -------
+  function clearOpFilters(tbodyId, typeId, searchId){
+    document.getElementById(typeId).value = 'all';
+    document.getElementById(searchId).value = '';
+    filterOps(tbodyId, typeId, searchId);
+  }
+  function filterOps(tbodyId, typeId, searchId){
+    const type = (document.getElementById(typeId).value || 'all').toLowerCase();
+    const q = (document.getElementById(searchId).value || '').toLowerCase().trim();
+    const rows = document.querySelectorAll('#'+tbodyId+' tr');
+    rows.forEach(tr=>{
+      const op   = (tr.getAttribute('data-op')||'').toLowerCase();
+      const id   = String(tr.getAttribute('data-id')||'').toLowerCase();
+      const l4   = (tr.getAttribute('data-last4')||'').toLowerCase();
+      const tb   = (tr.getAttribute('data-tb')||'').toLowerCase();
+      const note = (tr.getAttribute('data-note')||'').toLowerCase();
+      let okType = (type==='all') || (op===type);
+      let okText = (q==='') || id.includes(q) || l4.includes(q) || tb.includes(q) || note.includes(q);
+      tr.style.display = (okType && okText) ? '' : 'none';
+    });
+  }
+  // ------- сортировка по клику в таблицах истории -------
+  function getSortPrefKey(tbodyId){
+    return 'payments.sort.'+tbodyId;
+  }
+  function applySavedSort(tbodyId){
+    try{
+      const pref = localStorage.getItem(getSortPrefKey(tbodyId));
+      if (!pref) return;
+      const {key, dir} = JSON.parse(pref);
+      if (key && dir) sortOpsTable(tbodyId, key, dir, /*save=*/false);
+    } catch(e){}
+  }
+  function initSortFor(tbodyId){
+    try{
+      const tb  = document.getElementById(tbodyId);
+      if (!tb) return;
+      const table = tb.closest('table');
+      const thead = table ? table.querySelector('thead') : null;
+      if (!thead) return;
+      const ths = Array.from(thead.querySelectorAll('th'));
+      const keys = ['id','created','card','tb','type','amount','note', null];
+      ths.forEach((th, idx)=>{
+        const key = th.getAttribute('data-sort') || keys[idx] || null;
+        if (!key) return;
+        th.classList.add('sortable');
+        th.setAttribute('data-sort', key);
+        th.setAttribute('role','button');
+        th.setAttribute('tabindex','0');
+        th.addEventListener('click', ()=>{
+          const cur = th.getAttribute('aria-sort');
+          const dir = (cur === 'ascending') ? 'descending' : 'ascending';
+          sortOpsTable(tbodyId, key, dir, /*save=*/true);
+          ths.forEach(t => t.removeAttribute('aria-sort'));
+          th.setAttribute('aria-sort', dir);
+        });
+        th.addEventListener('keydown', (ev)=>{
+          if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); th.click(); }
+        });
+      });
+      // restore saved sort indicator
+      try{
+        const pref = localStorage.getItem(getSortPrefKey(tbodyId));
+        if (pref) {
+          const {key, dir} = JSON.parse(pref);
+          if (key && dir) {
+            const th = ths.find(th=> (th.getAttribute('data-sort')||'') === key);
+            if (th) th.setAttribute('aria-sort', dir);
+          }
+        }
+      }catch(e){}
+    } catch(e){}
+  }
+  function sortOpsTable(tbodyId, key, dir, save){
+    try{
+      const tb = document.getElementById(tbodyId);
+      if (!tb) return;
+      const rows = Array.from(tb.querySelectorAll('tr'));
+      const getVal = (tr)=>{
+        switch(key){
+          case 'id':      return parseInt(tr.dataset.id||'0',10) || 0;
+          case 'created': return parseInt(tr.dataset.created||'0',10) || 0;
+          case 'card':    return (tr.dataset.card||'').toLowerCase();
+          case 'tb':      return (tr.dataset.tb||'').toLowerCase();
+          case 'type':    return (tr.dataset.op||'').toLowerCase();
+          case 'amount':  return parseFloat(tr.dataset.amount||'0') || 0;
+          case 'note':    return (tr.dataset.note||'').toLowerCase();
+          default:        return 0;
+        }
+      };
+      rows.sort((a,b)=>{
+        const va = getVal(a), vb = getVal(b);
+        if (typeof va === 'number' && typeof vb === 'number') {
+          return (dir==='ascending') ? (va - vb) : (vb - va);
+        } else {
+          if (va < vb) return (dir==='ascending') ? -1 : 1;
+          if (va > vb) return (dir==='ascending') ? 1 : -1;
+          return 0;
+        }
+      });
+      // re-append rows
+      rows.forEach(r=>tb.appendChild(r));
+      if (save) {
+        try { localStorage.setItem(getSortPrefKey(tbodyId), JSON.stringify({key, dir})); } catch(e){}
+      }
+    } catch(e){}
+  }
+
+
+  // ------- клавиатура (только Enter) -------
+  document.addEventListener('keydown', (e)=>{
+    if (e.target && (e.target.id==='amountInput')) {
+      if (e.key==='Enter') { e.preventDefault(); quickSubmit(); return; }
+    }
+  });
+
+  // ------- helpers -------
+  function escapeHtml(s){ return String(s||'').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m])); }
+
+  // ------- автозагрузка последнего выбора -------
+  (function init(){
+    const lastTeam = parseInt(localStorage.getItem('payments.teamId')||'0',10);
+    const lastCard = parseInt(localStorage.getItem('payments.cardId')||'0',10);
+    if (lastTeam && DATA.teams.some(t=>t.id===lastTeam)) {
+      openTeam(lastTeam);
+      if (lastCard && DATA.cards.some(c=>c.id===lastCard && c.team_id===lastTeam)) {
+        openCard(lastCard);
+      }
+    }
+  })();
+
+    // ------- Drag & Drop сортировка (без перезагрузки) -------
+    function attachDnD(tb, scope, id, tbodyId){
+      try {
+        const rows = Array.from(tb.querySelectorAll('tr'));
+        if (rows.length === 0) return;
+
+        // helper: get tx id for a row
+        function getId(tr){
+          const hid = tr.querySelector('input[name="payment_id"]');
+          if (hid && hid.value) return parseInt(hid.value,10);
+          const b = tr.querySelector('button[data-id]');
+          if (b && b.getAttribute('data-id')) return parseInt(b.getAttribute('data-id'),10);
+          return NaN;
+        }
+
+        // prepare draggable
+        rows.forEach(tr=>{
+          const pid = getId(tr);
+          if (!Number.isFinite(pid)) return;
+          tr.dataset.txId = String(pid);
+          tr.setAttribute('draggable','true');
+        });
+
+        let dragEl = null;
+        const placeholder = document.createElement('tr');
+        placeholder.className = 'drag-placeholder';
+        const td = document.createElement('td');
+        td.colSpan = 100;
+        td.style.padding = '0';
+        td.style.border = 'none';
+        placeholder.appendChild(td);
+
+        tb.addEventListener('dragstart', (e)=>{
+          const tr = e.target.closest('tr');
+          if (!tr || !tr.dataset.txId) return;
+          dragEl = tr;
+          tr.classList.add('dragging');
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', tr.dataset.txId);
+        });
+
+        tb.addEventListener('dragover', (e)=>{
+          if (!dragEl) return;
+          e.preventDefault();
+          const after = getRowAfter(tb, e.clientY);
+          if (after == null) {
+            if (tb.lastElementChild !== placeholder) tb.appendChild(placeholder);
+          } else {
+            if (after !== placeholder) tb.insertBefore(placeholder, after);
+          }
+        });
+
+        tb.addEventListener('drop', async (e)=>{
+          if (!dragEl) return;
+          e.preventDefault();
+          if (placeholder.parentNode === tb) {
+            tb.insertBefore(dragEl, placeholder);
+            placeholder.remove();
+          }
+          dragEl.classList.remove('dragging');
+          await persistBulk(tb, scope, id);
+          dragEl = null;
+        });
+
+        tb.addEventListener('dragend', ()=>{
+          if (dragEl) dragEl.classList.remove('dragging');
+          placeholder.remove();
+          dragEl = null;
+        });
+
+        function getRowAfter(container, y){
+          const rws = [...container.querySelectorAll('tr[draggable="true"]:not(.dragging)')].filter(r=>r.style.display!=='none');
+          return rws.find(r=>{
+            const rect = r.getBoundingClientRect();
+            return y < rect.top + rect.height/2;
+          }) || null;
+        }
+
+        async function persistBulk(container, scope, id){
+          const ids = [...container.querySelectorAll('tr[draggable="true"]')]
+                        .filter(r=>r.style.display!=='none')
+                        .map(r=>parseInt(r.dataset.txId,10))
+                        .filter(n=>Number.isFinite(n));
+          if (ids.length === 0) return;
+          try {
+            const fd = new FormData();
+            fd.append('csrf', DATA.csrf);
+            fd.append('ajax','1');
+            fd.append('reorder_many','1');
+            fd.append('scope', scope);
+            fd.append('id', String(id));
+            fd.append('ids', JSON.stringify(ids));
+            const res = await fetch(DATA.self, { method:'POST', body: fd, credentials:'same-origin' });
+            const j = await res.json();
+            if (!j.ok) { showToast(j.error || 'Не удалось сохранить порядок', true); }
+            else { showToast('Порядок сохранён'); }
+          } catch (e) { showToast('Ошибка запроса', true); }
+        }
+      } catch (e){ /* no-op */ }
+    }
+
+    (function(){
+      try {
+        const css = '.dragging{opacity:.6}.drag-placeholder td{border-top:2px dashed #666}';
+        const st = document.createElement('style'); st.textContent = css; document.head.appendChild(st);
+      } catch(e){}
+    })();
+
+
+    async function saveOrderFromDOM(container, scope, id){
+      const ids = [...container.querySelectorAll('tr[draggable="true"], tr')]
+                    .map(r=>{
+                      const hid = r.querySelector('input[name="payment_id"]');
+                      if (hid && hid.value) return parseInt(hid.value,10);
+                      const b = r.querySelector('button[data-id]');
+                      if (b && b.getAttribute('data-id')) return parseInt(b.getAttribute('data-id'),10);
+                      return NaN;
+                    })
+                    .filter(n=>Number.isFinite(n));
+      if (ids.length === 0) return;
+      const fd = new FormData();
+      fd.append('csrf', DATA.csrf);
+      fd.append('ajax','1');
+      fd.append('reorder_many','1');
+      fd.append('scope', scope);
+      fd.append('id', String(id));
+      fd.append('ids', JSON.stringify(ids));
+      const res = await fetch(DATA.self, { method:'POST', body: fd, credentials:'same-origin' });
+      const j = await res.json();
+      if (!j.ok) { showToast(j.error || 'Не удалось сохранить порядок', true); }
+      else { showToast('Порядок сохранён'); }
+    }
+
+
+    // init sortable headers
+    try { initSortFor('opsBodyTeam'); } catch(e){}
+    try { initSortFor('opsBodyCard'); } catch(e){}
+
+</script>
+
+<?php include __DIR__.'/_layout_footer.php'; ?>

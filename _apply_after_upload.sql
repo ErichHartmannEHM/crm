@@ -1,0 +1,1 @@
+-- idempotent alterations placeholder (empty since fresh schema is complete).
