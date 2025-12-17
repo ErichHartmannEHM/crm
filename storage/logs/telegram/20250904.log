@@ -1,0 +1,36 @@
+[03:20:32] autoshow_menu chat=-1003041567533 reason=plain_text
+[07:51:14] autoshow_menu chat=-1003041567533 reason=plain_text
+[08:13:30] autoshow_menu chat=-1003041567533 reason=plain_text
+[08:21:46] autoshow_menu chat=-1003041567533 reason=plain_text
+[08:22:29] autoshow_menu chat=-1003041567533 reason=plain_text
+[08:26:44] editMessageText ERR chat=-1003041567533: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[10:36:17] editMessageText ERR chat=-4238777962: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[10:36:19] editMessageText ERR chat=-4238777962: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[10:36:32] drop:newop chat=-4238777962 drop_id=4 thr=0
+[10:43:32] drop:newop chat=-4238777962 drop_id=4 thr=0
+[10:43:53] /sum commit chat=-4238777962 thr=0 drop_id=4 card_id=28 type=debit amount=50
+[10:44:11] drop:newop chat=-4238777962 drop_id=4 thr=0
+[10:47:19] editMessageText ERR chat=-4238777962: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[10:49:01] drop:newop chat=-4238777962 drop_id=4 thr=0
+[10:49:37] drop:newop chat=-4238777962 drop_id=4 thr=0
+[10:50:13] drop:newop chat=-4238777962 drop_id=4 thr=0
+[10:50:35] editMessageText ERR chat=-4238777962: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[10:50:36] editMessageText ERR chat=-4238777962: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[10:50:52] /sum commit chat=-4238777962 thr=0 drop_id=4 card_id=28 type=debit amount=7041.67
+[11:10:05] editMessageText ERR chat=-4238777962: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[11:10:07] drop:newop chat=-4238777962 drop_id=4 thr=0
+[11:10:27] /sum commit chat=-4238777962 thr=0 drop_id=4 card_id=28 type=debit amount=550.83
+[11:10:34] drop:newop chat=-4238777962 drop_id=4 thr=0
+[11:41:38] drop:newop chat=-4238777962 drop_id=4 thr=0
+[11:41:55] /sum commit chat=-4238777962 thr=0 drop_id=4 card_id=28 type=topup amount=1
+[12:53:27] editMessageText ERR chat=-1003041567533: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[12:56:06] autoshow_menu chat=-4884699865 reason=plain_text
+[13:34:23] autoshow_menu chat=-1003041567533 reason=plain_text
+[13:42:56] autoshow_menu chat=-4238777962 reason=plain_text
+[13:44:13] autoshow_menu chat=-4884699865 reason=plain_text
+[18:24:53] autoshow_menu chat=-1003041567533 reason=plain_text
+[19:00:24] autoshow_menu chat=-4238777962 reason=plain_text
+[19:06:49] autoshow_menu chat=-4238777962 reason=plain_text
+[19:09:11] autoshow_menu chat=-4238777962 reason=plain_text
+[19:13:19] autoshow_menu chat=-4238777962 reason=plain_text
+[20:35:35] autoshow_menu chat=-1003041567533 reason=plain_text

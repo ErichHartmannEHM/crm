@@ -1,0 +1,7 @@
+[17:07:11] answerCallbackQuery ERR: HTTP 400: {"ok":false,"error_code":400,"description":"Bad Request: query is too old and response timeout expired or query ID is invalid"}
+[17:07:11] sendMessage ERR: HTTP 400: {"ok":false,"error_code":400,"description":"Bad Request: chat not found"}
+[17:07:13] answerCallbackQuery ERR: HTTP 400: {"ok":false,"error_code":400,"description":"Bad Request: query is too old and response timeout expired or query ID is invalid"}
+[17:07:13] sendMessage ERR: HTTP 400: {"ok":false,"error_code":400,"description":"Bad Request: chat not found"}
+[17:07:14] answerCallbackQuery ERR: HTTP 400: {"ok":false,"error_code":400,"description":"Bad Request: query is too old and response timeout expired or query ID is invalid"}
+[17:07:14] sendMessage ERR: HTTP 400: {"ok":false,"error_code":400,"description":"Bad Request: chat not found"}
+[19:21:34] editMessageText ERR: HTTP 400: {"ok":false,"error_code":400,"description":"Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message"}

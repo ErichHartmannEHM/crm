@@ -1,0 +1,18 @@
+[01:01:31] editMessageText ERR chat=-1003041567533: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[09:14:09] editMessageText ERR chat=-1003041567533: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[10:55:09] editMessageText ERR chat=-1003041567533: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[11:04:52] editMessageText ERR chat=-1003041567533: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[11:17:08] editMessageText ERR chat=-1003041567533: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[12:02:55] sendMessage(thr) ERR chat=-4876879624/thr=0: cURL: Failed to connect to api.telegram.org port 443 after 6001 ms: Timeout was reached|RAW=
+[12:02:55] dedup: skip sendMessage(thr) chat=-4876879624/thr=0
+[12:03:06] answerCallbackQuery ERR: cURL: Failed to connect to api.telegram.org port 443 after 6040 ms: Timeout was reached
+[12:03:12] answerCallbackQuery ERR: cURL: Failed to connect to api.telegram.org port 443 after 6002 ms: Timeout was reached
+[12:03:31] editMessageText ERR chat=-1003041567533: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[12:07:59] editMessageText ERR chat=-1003041567533: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[12:25:18] editMessageText ERR chat=-1003041567533: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[12:25:34] editMessageText ERR chat=-1003036274761: TG error 400: Bad Request: can't parse entities: Unsupported start tag "" at byte offset 258|RAW=Array
+[12:25:36] editMessageText ERR chat=-1003036274761: TG error 400: Bad Request: can't parse entities: Unsupported start tag "" at byte offset 258|RAW=Array
+[12:25:41] editMessageText ERR chat=-1003036274761: TG error 400: Bad Request: can't parse entities: Unsupported start tag "" at byte offset 258|RAW=Array
+[12:25:52] editMessageText ERR chat=-1003036274761: TG error 400: Bad Request: can't parse entities: Unsupported start tag "" at byte offset 258|RAW=Array
+[12:25:53] editMessageText ERR chat=-1003036274761: TG error 400: Bad Request: can't parse entities: Unsupported start tag "" at byte offset 258|RAW=Array
+[12:25:54] editMessageText ERR chat=-1003036274761: TG error 400: Bad Request: can't parse entities: Unsupported start tag "" at byte offset 258|RAW=Array

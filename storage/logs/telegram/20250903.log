@@ -1,0 +1,88 @@
+[12:22:17] drop:newop chat=-4884699865 drop_id=5 thr=0
+[12:22:29] /sum commit chat=-4884699865 thr=0 drop_id=5 card_id=30 type=topup amount=1
+[12:22:42] drop:newop chat=-4884699865 drop_id=5 thr=0
+[12:22:53] /sum commit chat=-4884699865 thr=0 drop_id=5 card_id=30 type=topup amount=1
+[12:22:53] notify_drop_op_by_card: cards info query failed: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'c.last4' in 'SELECT'
+[12:22:53] notify_drop_op_by_card: no admin chats configured
+[12:24:04] drop:newop chat=-4884699865 drop_id=5 thr=0
+[12:24:13] /sum commit chat=-4884699865 thr=0 drop_id=5 card_id=30 type=debit amount=1
+[12:24:14] notify_drop_op_by_card: cards info query failed: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'c.last4' in 'SELECT'
+[12:24:14] notify_drop_op_by_card: no admin chats configured
+[12:24:37] drop:newop chat=-4884699865 drop_id=5 thr=0
+[12:24:47] /sum commit chat=-4884699865 thr=0 drop_id=5 card_id=30 type=hold amount=1
+[12:24:47] notify_drop_op_by_card: cards info query failed: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'c.last4' in 'SELECT'
+[12:24:47] notify_drop_op_by_card: no admin chats configured
+[12:25:21] drop:newop chat=-4884699865 drop_id=5 thr=0
+[12:25:32] /sum commit chat=-4884699865 thr=0 drop_id=5 card_id=30 type=debit amount=1222
+[12:25:32] notify_drop_op_by_card: cards info query failed: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'c.last4' in 'SELECT'
+[12:25:32] notify_drop_op_by_card: no admin chats configured
+[12:28:36] editMessageText ERR chat=-4884699865: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[12:28:40] drop:newop chat=-4884699865 drop_id=5 thr=0
+[12:43:29] drop:newop chat=-4884699865 drop_id=5 thr=0
+[12:48:31] autoshow_menu chat=-4884699865 reason=plain_text
+[13:14:45] autoshow_menu chat=-4884699865 reason=plain_text
+[13:32:03] drop:newop chat=-4238777962 drop_id=4 thr=0
+[13:33:31] drop:newop chat=-4238777962 drop_id=4 thr=0
+[13:35:33] drop:newop chat=-4238777962 drop_id=4 thr=0
+[13:35:50] drop:newop chat=-4238777962 drop_id=4 thr=0
+[13:36:04] /sum commit chat=-4238777962 thr=0 drop_id=4 card_id=28 type=topup amount=1
+[13:36:04] notify_drop_op_by_card: cards info query failed: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'c.last4' in 'SELECT'
+[13:36:05] notify_drop_op_by_card: no admin chats configured
+[13:53:26] drop:newop chat=-4238777962 drop_id=4 thr=0
+[13:53:34] /sum commit chat=-4238777962 thr=0 drop_id=4 card_id=28 type=topup amount=1
+[13:53:34] notify_drop_op_by_card: cards info query failed: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'c.last4' in 'SELECT'
+[13:53:35] notify_drop_op_by_card: no admin chats configured
+[13:54:24] drop:newop chat=-4238777962 drop_id=4 thr=0
+[14:11:29] drop:newop chat=-4238777962 drop_id=4 thr=0
+[14:13:27] drop:newop chat=-4884699865 drop_id=5 thr=0
+[14:13:42] /sum commit chat=-4884699865 thr=0 drop_id=5 card_id=30 type=topup amount=5103.73
+[14:13:43] notify_drop_op_by_card: cards info query failed: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'c.last4' in 'SELECT'
+[14:13:43] notify_drop_op_by_card: no admin chats configured
+[14:13:45] drop:newop chat=-4884699865 drop_id=5 thr=0
+[14:14:06] /sum commit chat=-4884699865 thr=0 drop_id=5 card_id=30 type=topup amount=60.58
+[14:14:06] notify_drop_op_by_card: cards info query failed: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'c.last4' in 'SELECT'
+[14:14:06] notify_drop_op_by_card: no admin chats configured
+[14:14:57] drop:newop chat=-4884699865 drop_id=5 thr=0
+[14:15:25] /sum commit chat=-4884699865 thr=0 drop_id=5 card_id=30 type=debit amount=5103.73
+[14:15:25] notify_drop_op_by_card: cards info query failed: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'c.last4' in 'SELECT'
+[14:15:26] notify_drop_op_by_card: no admin chats configured
+[14:15:28] drop:newop chat=-4884699865 drop_id=5 thr=0
+[14:15:46] /sum commit chat=-4884699865 thr=0 drop_id=5 card_id=30 type=debit amount=60.58
+[14:15:47] notify_drop_op_by_card: cards info query failed: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'c.last4' in 'SELECT'
+[14:15:47] notify_drop_op_by_card: no admin chats configured
+[14:15:50] drop:newop chat=-4884699865 drop_id=5 thr=0
+[14:15:58] /sum commit chat=-4884699865 thr=0 drop_id=5 card_id=30 type=debit amount=0.83
+[14:15:58] notify_drop_op_by_card: cards info query failed: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'c.last4' in 'SELECT'
+[14:15:58] notify_drop_op_by_card: no admin chats configured
+[14:16:01] drop:newop chat=-4884699865 drop_id=5 thr=0
+[14:16:26] /sum commit chat=-4884699865 thr=0 drop_id=5 card_id=30 type=debit amount=5103.73
+[14:16:26] notify_drop_op_by_card: cards info query failed: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'c.last4' in 'SELECT'
+[14:16:26] notify_drop_op_by_card: no admin chats configured
+[14:16:28] drop:newop chat=-4884699865 drop_id=5 thr=0
+[14:16:38] /sum commit chat=-4884699865 thr=0 drop_id=5 card_id=30 type=hold amount=5103.73
+[14:16:38] notify_drop_op_by_card: cards info query failed: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'c.last4' in 'SELECT'
+[14:16:39] notify_drop_op_by_card: no admin chats configured
+[14:16:42] drop:newop chat=-4884699865 drop_id=5 thr=0
+[14:17:06] /sum commit chat=-4884699865 thr=0 drop_id=5 card_id=30 type=debit amount=5125
+[14:17:06] notify_drop_op_by_card: cards info query failed: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'c.last4' in 'SELECT'
+[14:17:07] notify_drop_op_by_card: no admin chats configured
+[14:19:57] editMessageText ERR chat=-1003041567533: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[15:48:08] editMessageText ERR chat=-4884699865: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
+[15:48:21] drop:newop chat=-4884699865 drop_id=5 thr=0
+[15:48:29] /sum commit chat=-4884699865 thr=0 drop_id=5 card_id=30 type=topup amount=1
+[15:48:29] notify_drop_op_by_card: no admin chats configured
+[16:12:12] autoshow_menu chat=-4238777962 reason=plain_text
+[16:13:05] autoshow_menu chat=-4238777962 reason=plain_text
+[16:13:41] autoshow_menu chat=-4238777962 reason=plain_text
+[16:15:09] autoshow_menu chat=-4238777962 reason=plain_text
+[16:17:38] autoshow_menu chat=-4238777962 reason=plain_text
+[16:51:12] autoshow_menu chat=-1003041567533 reason=plain_text
+[16:57:22] sendMessage(thr) ERR chat=-1003041567533/thr=686: TG error 400: Bad Request: message thread not found|RAW=Array
+[16:57:22] autoshow_menu chat=-1003041567533 reason=plain_text
+[16:59:02] autoshow_menu chat=-1003041567533 reason=plain_text
+[16:59:35] autoshow_menu chat=-1003041567533 reason=plain_text
+[17:00:12] sendMessage(thr) ERR chat=-1003041567533/thr=686: TG error 400: Bad Request: message thread not found|RAW=Array
+[17:00:12] autoshow_menu chat=-1003041567533 reason=plain_text
+[17:00:42] autoshow_menu chat=-1003041567533 reason=plain_text
+[17:02:03] autoshow_menu chat=-1003041567533 reason=plain_text
+[19:16:49] autoshow_menu chat=-1003041567533 reason=plain_text

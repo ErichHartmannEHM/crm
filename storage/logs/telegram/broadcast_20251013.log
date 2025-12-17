@@ -1,0 +1,13 @@
+[15:55:41] broadcast scope=drop inwork=0 sent=21
+[2025-10-13 16:27:54] DB connect error: SQLSTATE[HY000] [1045] Access denied for user 'root'@'localhost' (using password: NO)
+[2025-10-13 16:27:58] DB connect error: SQLSTATE[HY000] [1045] Access denied for user 'root'@'localhost' (using password: NO)
+[2025-10-13 16:28:03] DB connect error: SQLSTATE[HY000] [1045] Access denied for user 'root'@'localhost' (using password: NO)
+[2025-10-13 16:28:03] DB connect error: SQLSTATE[HY000] [1045] Access denied for user 'root'@'localhost' (using password: NO)
+[2025-10-13 16:28:03] DB connect error: SQLSTATE[HY000] [1045] Access denied for user 'root'@'localhost' (using password: NO)
+[2025-10-13 16:28:09] DB connect error: SQLSTATE[HY000] [1045] Access denied for user 'root'@'localhost' (using password: NO)
+[2025-10-13 16:46:36] DB connect error: SQLSTATE[HY000] [1045] Access denied for user 'root'@'localhost' (using password: NO)
+[2025-10-13 16:46:36] DB connect error: SQLSTATE[HY000] [1045] Access denied for user 'root'@'localhost' (using password: NO)
+[2025-10-13 16:46:36] DB connect error: SQLSTATE[HY000] [1045] Access denied for user 'root'@'localhost' (using password: NO)
+[2025-10-13 17:24:48] DB connect error: SQLSTATE[HY000] [1045] Access denied for user 'root'@'localhost' (using password: NO)
+[2025-10-13 17:24:48] DB connect error: SQLSTATE[HY000] [1045] Access denied for user 'root'@'localhost' (using password: NO)
+[2025-10-13 17:24:48] DB connect error: SQLSTATE[HY000] [1045] Access denied for user 'root'@'localhost' (using password: NO)

@@ -1,0 +1,1 @@
+[11:27:58] editMessageText ERR chat=-1003041567533: TG error 400: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message|RAW=Array
